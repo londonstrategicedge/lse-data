@@ -1,13 +1,19 @@
 """
-LSE WebSocket client for real-time market data streaming.
+LSE market data client: live streaming over WebSocket and historical
+download over REST, both authorized by the same API key.
 
-Connects to wss://data-ws.londonstrategicedge.com and provides a clean
-interface for subscribing to symbols and receiving live price ticks.
+Streaming connects to wss://data-ws.londonstrategicedge.com; download calls
+https://api.londonstrategicedge.com. One key, one monthly data allowance shared
+across both.
 """
 
 import asyncio
 import json
+import os
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterator, List, Optional, Set
 
@@ -16,6 +22,26 @@ import websockets.client
 
 
 WS_URL = "wss://data-ws.londonstrategicedge.com"
+# REST download base. The same key authorizes streaming and download; the server
+# caps each call at 5,000 rows and 100 calls/min and meters response bytes
+# against the same monthly allowance as streaming.
+API_URL = "https://api.londonstrategicedge.com/iso"
+# The download host is behind a CDN that blocks the default Python-urllib
+# User-Agent. Send our own so requests are not bounced before reaching the API.
+_USER_AGENT = "lse-data-sdk (+https://londonstrategicedge.com)"
+# Public instrument catalog (no key required). Lists every downloadable /
+# streamable instrument with its display name and category.
+_CATALOG_URL = "https://londonstrategicedge.com/feed-catalog.json"
+
+
+class LSEError(Exception):
+    """Raised when a REST download call returns a non-2xx response (bad filter,
+    rate limit, quota exceeded, forbidden table, etc.)."""
+
+    def __init__(self, status: int, message: str):
+        self.status = status
+        self.message = message
+        super().__init__(f"[{status}] {message}")
 
 # Ping interval to keep the connection alive. The server expects a ping
 # within its idle timeout window (currently 600s). We send every 25s to
@@ -31,9 +57,22 @@ class Tick:
     bid: Optional[float] = None
     ask: Optional[float] = None
     volume: Optional[float] = None
-    timestamp: Optional[float] = None
+    # ISO-8601 string as sent by the server (e.g. "2026-06-04T16:32:00Z").
+    # Use the `datetime` property for a parsed, timezone-aware value.
+    timestamp: Optional[str] = None
     name: Optional[str] = None
     replay: bool = False  # True for historical ticks during replay
+
+    @property
+    def datetime(self):
+        """The tick time as a timezone-aware ``datetime``, or None."""
+        if not self.timestamp:
+            return None
+        from datetime import datetime as _datetime
+        try:
+            return _datetime.fromisoformat(str(self.timestamp).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
 
     def __repr__(self) -> str:
         r = " REPLAY" if self.replay else ""
@@ -45,7 +84,11 @@ class LSE:
 
     Args:
         api_key: Your LSE API key. Get one at https://londonstrategicedge.com/data
+                 If omitted, the LSE_API_KEY environment variable is used.
         url: WebSocket endpoint. Defaults to the production server.
+
+    Works as a context manager (``with LSE(...) as client:``), disconnecting
+    on exit.
 
     Examples:
         Synchronous streaming:
@@ -86,7 +129,13 @@ class LSE:
             client.connect()
     """
 
-    def __init__(self, api_key: str, url: str = WS_URL):
+    def __init__(self, api_key: Optional[str] = None, url: str = WS_URL):
+        api_key = api_key or os.environ.get("LSE_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "No API key. Pass api_key=... or set the LSE_API_KEY environment "
+                "variable. Get a key at https://londonstrategicedge.com/data"
+            )
         self._api_key = api_key
         self._url = url
         self._ws: Optional[websockets.client.WebSocketClientProtocol] = None
@@ -103,6 +152,18 @@ class LSE:
         self._disconnect_requested = False
         # Reference to the event loop running _run_forever, used by disconnect()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Timeout (seconds) for REST download calls.
+        self._rest_timeout = 30
+        # Cached instrument catalog (fetched once, on first catalog() call).
+        self._catalog_cache: Optional[List[dict]] = None
+
+    def __enter__(self) -> "LSE":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        # Ensure the WebSocket is torn down if a streaming block raises.
+        self.disconnect()
+        return False
 
     # ------------------------------------------------------------------
     # Public properties
@@ -194,7 +255,7 @@ class LSE:
                 print(f"{'REPLAY' if tick.replay else 'LIVE'} {tick.symbol}: ${tick.price}")
         """
         self._disconnect_requested = False
-        while True:
+        while not self._disconnect_requested:
             try:
                 # Run the async generator in a new event loop.
                 # We suppress "task was destroyed" warnings that occur when
@@ -209,6 +270,9 @@ class LSE:
                         tick = loop.run_until_complete(gen.__anext__())
                         yield tick
                 except StopAsyncIteration:
+                    # The single connection ended (drop, disconnect(), or a
+                    # fatal error). Fall through to the stop/reconnect decision
+                    # below instead of looping unconditionally.
                     pass
                 except GeneratorExit:
                     return
@@ -225,9 +289,13 @@ class LSE:
                     self._loop = None
             except Exception as e:
                 self._emit("error", str(e))
-                if not reconnect or self._disconnect_requested:
-                    return
-                time.sleep(3)
+            # Stop on an explicit disconnect(), a fatal error (which sets
+            # _disconnect_requested), or when auto-reconnect is off. This check
+            # runs for BOTH a clean end and an exception, so a disconnect during
+            # a stream()/replay loop exits instead of silently reconnecting.
+            if self._disconnect_requested or not reconnect:
+                return
+            time.sleep(3)
 
     def connect(self, symbols: Optional[List[str]] = None):
         """Connect and block forever, dispatching events via callbacks.
@@ -346,6 +414,181 @@ class LSE:
                     pass
 
     # ------------------------------------------------------------------
+    # REST data download (historical) — same key as streaming
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _symbol_slug(symbol: str) -> str:
+        return symbol.lower().replace("/", "_").replace("-", "_").replace(".", "_")
+
+    def _rest_get(self, table: str, params: List[tuple]) -> List[dict]:
+        """GET /iso/<table> with the API key. `params` is a list of (key, value)
+        tuples so a column can repeat (the API ANDs repeated filters, e.g. a
+        gte and an lt on timestamp). Returns a list of row dicts; raises
+        LSEError on any non-2xx response or API error body."""
+        # Keep filter operator punctuation (. , ( ) : *) unescaped.
+        qs = urllib.parse.urlencode(params, safe=".,():*")
+        url = f"{API_URL}/{table}" + (f"?{qs}" if qs else "")
+        req = urllib.request.Request(url, headers={
+            "x-api-key": self._api_key,
+            "User-Agent": _USER_AGENT,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=self._rest_timeout) as resp:
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            msg = raw
+            try:
+                j = json.loads(raw)
+                msg = j.get("message") or j.get("error") or raw
+            except Exception:
+                pass
+            raise LSEError(e.code, msg)
+        data = json.loads(body)
+        if isinstance(data, dict) and data.get("code") and "message" in data:
+            raise LSEError(400, data["message"])
+        return data
+
+    def candles(self, symbol: str, timeframe: str = "1m", start: Optional[str] = None,
+                end: Optional[str] = None, limit: int = 5000, order: str = "asc") -> List[dict]:
+        """Historical OHLCV candles for any non-option instrument (stocks, FX,
+        crypto, commodities, indices, ETFs).
+
+        timeframe: "1m", "5m", "15m", "1h", "4h", or "1d".
+        start / end: ISO timestamps (e.g. "2026-01-01") filtering the bar time.
+        The server caps each call at 5,000 rows; page with start/end for more.
+
+        Example:
+            client.candles("BTC/USD", "1d", start="2026-01-01")
+            client.candles("AAPL", "1h", limit=200, order="desc")
+        """
+        tf = timeframe.lower()
+        p: List[tuple] = [("order", f"timestamp.{order}"), ("limit", str(min(int(limit), 5000)))]
+        if start:
+            p.append(("timestamp", f"gte.{start}"))
+        if end:
+            p.append(("timestamp", f"lt.{end}"))
+        htf = {"5m": "x_candles_5m", "15m": "x_candles_15m", "1h": "x_candles_1h",
+               "4h": "x_candles_4h", "1d": "x_candles_1d"}
+        if tf in htf:
+            return self._rest_get(htf[tf], [("symbol", f"eq.{symbol}")] + p)
+        if tf == "1m":
+            # Per-symbol 1m table: most instruments use candles_<sym>; US stocks
+            # and ETFs use d_candles_<sym>. Try the common one, fall back on 404.
+            slug = self._symbol_slug(symbol)
+            try:
+                return self._rest_get(f"candles_{slug}", p)
+            except LSEError as e:
+                if e.status == 404:
+                    return self._rest_get(f"d_candles_{slug}", p)
+                raise
+        raise LSEError(400, f"unsupported timeframe '{timeframe}' (use 1m/5m/15m/1h/4h/1d)")
+
+    def economic_calendar(self, region=None, event: Optional[str] = None,
+                          start: Optional[str] = None, end: Optional[str] = None,
+                          released_only: bool = False, order: str = "asc",
+                          limit: int = 5000) -> List[dict]:
+        """Macro economic events (CPI, NFP, rate decisions, GDP, ...).
+        region: a code like "US" or a list like ["US","EU","GB"].
+        released_only: only events whose `actual` has printed."""
+        p: List[tuple] = [("is_stale", "is.false"), ("order", f"datetime.{order}"),
+                          ("limit", str(min(int(limit), 5000)))]
+        if region is not None:
+            if isinstance(region, (list, tuple, set)):
+                p.append(("region_code", f"in.({','.join(region)})"))
+            else:
+                p.append(("region_code", f"eq.{region}"))
+        if event:
+            p.append(("event", f"ilike.*{event}*"))
+        if start:
+            p.append(("datetime", f"gte.{start}"))
+        if end:
+            p.append(("datetime", f"lt.{end}"))
+        if released_only:
+            p.append(("actual", "not.is.null"))
+        return self._rest_get("economic_calender", p)
+
+    def insider_trades(self, symbol: Optional[str] = None, type: Optional[str] = None,
+                       start: Optional[str] = None, end: Optional[str] = None,
+                       order: str = "desc", limit: int = 5000) -> List[dict]:
+        """SEC Form 3/4/5 insider transactions. `type` is an SEC code, e.g.
+        "P-Purchase" or "S-Sale"; start/end filter `transaction_date`."""
+        p: List[tuple] = [("order", f"transaction_date.{order}"), ("limit", str(min(int(limit), 5000)))]
+        if symbol:
+            p.append(("symbol", f"eq.{symbol}"))
+        if type:
+            p.append(("transaction_type", f"eq.{type}"))
+        if start:
+            p.append(("transaction_date", f"gte.{start}"))
+        if end:
+            p.append(("transaction_date", f"lt.{end}"))
+        return self._rest_get("z_insider_trades", p)
+
+    def dividends(self, symbol: Optional[str] = None, start: Optional[str] = None,
+                  end: Optional[str] = None, order: str = "desc", limit: int = 5000) -> List[dict]:
+        """Dividend events; start/end filter the ex-date (`effective_date`)."""
+        p: List[tuple] = [("order", f"effective_date.{order}"), ("limit", str(min(int(limit), 5000)))]
+        if symbol:
+            p.append(("symbol", f"eq.{symbol}"))
+        if start:
+            p.append(("effective_date", f"gte.{start}"))
+        if end:
+            p.append(("effective_date", f"lt.{end}"))
+        return self._rest_get("dividends", p)
+
+    def splits(self, symbol: Optional[str] = None, start: Optional[str] = None,
+               end: Optional[str] = None, order: str = "desc", limit: int = 5000) -> List[dict]:
+        """Stock split events; start/end filter `effective_date`."""
+        p: List[tuple] = [("order", f"effective_date.{order}"), ("limit", str(min(int(limit), 5000)))]
+        if symbol:
+            p.append(("symbol", f"eq.{symbol}"))
+        if start:
+            p.append(("effective_date", f"gte.{start}"))
+        if end:
+            p.append(("effective_date", f"lt.{end}"))
+        return self._rest_get("stock_splits", p)
+
+    def get(self, table: str, **filters) -> List[dict]:
+        """Generic download: any downloadable table with raw query filters.
+        Options and company profiles are not downloadable and return an error.
+
+        Example:
+            client.get("z_insider_trades", symbol="eq.AAPL", limit="10")
+        """
+        return self._rest_get(table, [(k, str(v)) for k, v in filters.items()])
+
+    def catalog(self, category: Optional[str] = None) -> List[dict]:
+        """List every available instrument, each a dict of
+        {"symbol", "name", "category"}. No connection or key required; use it
+        to discover exact symbols before streaming or downloading.
+
+        category (optional): one of stock, forex, crypto, etf, commodity, index
+        (singular or plural). Omit for the full list.
+
+        Example:
+            client.catalog()                   # all ~4,100 instruments
+            crypto = client.catalog("crypto")  # [{"symbol": "BTC/USD", ...}, ...]
+            symbols = [x["symbol"] for x in client.catalog("forex")]
+        """
+        if self._catalog_cache is None:
+            req = urllib.request.Request(_CATALOG_URL, headers={"User-Agent": _USER_AGENT})
+            with urllib.request.urlopen(req, timeout=self._rest_timeout) as resp:
+                self._catalog_cache = json.loads(resp.read().decode("utf-8"))
+        items = self._catalog_cache
+        if category:
+            norm = {
+                "stock": "Stocks", "stocks": "Stocks", "equity": "Stocks", "equities": "Stocks",
+                "forex": "Forex", "fx": "Forex", "crypto": "Crypto",
+                "etf": "ETFs", "etfs": "ETFs",
+                "commodity": "Commodities", "commodities": "Commodities",
+                "index": "Indices", "indices": "Indices",
+            }
+            want = norm.get(category.lower(), category)
+            items = [x for x in items if x.get("category") == want]
+        return list(items)
+
+    # ------------------------------------------------------------------
     # Async API
     # ------------------------------------------------------------------
 
@@ -372,16 +615,19 @@ class LSE:
             asyncio.run(main())
         """
         self._disconnect_requested = False
-        while True:
+        while not self._disconnect_requested:
             try:
                 async for tick in self._stream_once(symbols, start=start):
                     yield tick
             except Exception as e:
                 self._emit("error", str(e))
                 self._emit("disconnected")
-                if not reconnect or self._disconnect_requested:
-                    return
-                await asyncio.sleep(3)
+            # Stop on disconnect(), a fatal error (bad key / over quota, which
+            # sets _disconnect_requested), or reconnect=off, whether the
+            # connection ended cleanly or via exception. Otherwise back off.
+            if self._disconnect_requested or not reconnect:
+                return
+            await asyncio.sleep(3)
 
     async def connect_async(self, symbols: Optional[List[str]] = None):
         """Async version of connect(). Blocks forever until disconnect()."""
@@ -478,7 +724,15 @@ class LSE:
                         self._emit("replay_started", msg)
 
                     elif msg_type == "error":
+                        code = msg.get("code", "")
                         self._emit("error", msg.get("message", "Unknown error"))
+                        # Fatal errors will never succeed on retry: a bad/inactive
+                        # key, or a key that is over its monthly data limit. Any
+                        # error that arrives before we authenticate is fatal too.
+                        # Stop the (re)connect loop instead of hammering forever.
+                        if code in ("INVALID_KEY", "MISSING_KEY", "QUOTA_EXCEEDED") or not self._authenticated:
+                            self._disconnect_requested = True
+                            break
 
                     elif msg_type in ("pong", "unsubscribed", "subscribed",
                                       "options_subscribed", "options_unsubscribed"):

@@ -1,6 +1,6 @@
-"""WebSocket client for London Strategic Edge live market data."""
+"""Client for London Strategic Edge market data: live streaming and historical download."""
 
-from lse.client import LSE, Tick
+from lse.client import LSE, Tick, LSEError
 
-__version__ = "0.9.3"
-__all__ = ["LSE", "Tick"]
+__version__ = "0.10.0"
+__all__ = ["LSE", "Tick", "LSEError"]

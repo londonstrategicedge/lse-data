@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lse-data"
-version = "0.9.3"
-description = "Python WebSocket client for London Strategic Edge live market data"
+version = "0.10.0"
+description = "Python client for London Strategic Edge market data: live streaming and historical download"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"
