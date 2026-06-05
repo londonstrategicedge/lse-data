@@ -29,9 +29,9 @@ It covers stocks, forex, crypto, commodities, indices and ETFs, a little over 4,
 | Historical candles | yes | yes | yes | yes |
 | Asset classes | stocks, FX, crypto, commodities, indices, ETFs | equities focus | stocks, FX, crypto | stocks, FX, crypto |
 | Official API | yes | no, scrapes Yahoo | yes | yes |
-| Free key | yes | none needed | yes | yes |
+| Cost | free | free | free + paid | free + paid |
 
-The free key allows 100 calls a minute and 50 GB of data a month, shared between streaming and download.
+One key, no tiers. It allows 100 calls a minute and 50 GB of data a month, shared between streaming and download.
 
 ## Download history
 
