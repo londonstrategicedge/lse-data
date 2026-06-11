@@ -19,7 +19,7 @@ for tick in client.stream(["BTC/USD", "AAPL"]):
     print(tick.symbol, tick.price)
 ```
 
-It covers stocks, forex, crypto, commodities, indices and ETFs, a little over 4,000 instruments. Live ticks come over a websocket and history comes over plain HTTP, both on one key. Get a key at [londonstrategicedge.com/websockets](https://londonstrategicedge.com/websockets).
+It covers stocks, forex, crypto, commodities, indices, ETFs and options, 16,000+ instruments. Live ticks come over a websocket and history comes over plain HTTP. Get a key at [londonstrategicedge.com/websockets](https://londonstrategicedge.com/websockets).
 
 ## How it compares
 
@@ -31,11 +31,11 @@ It covers stocks, forex, crypto, commodities, indices and ETFs, a little over 4,
 | Official API | yes | no, scrapes Yahoo | yes | yes |
 | Cost | free | free | free + paid | free + paid |
 
-One key, no tiers. It allows 100 calls a minute and 50 GB of data a month, shared between streaming and download.
+The key allows 100 calls a minute and 50 GB of data a month, shared between streaming and download.
 
 ## Download history
 
-The same key pulls history over REST. Candles for any instrument, plus the economic calendar, insider trades, dividends and splits.
+The same key pulls history over REST: candles for any instrument, plus the economic calendar, insider trades, dividends and splits.
 
 ```python
 from lse import LSE
@@ -69,9 +69,24 @@ except LSEError as e:
 
 A call returns at most 5,000 rows. Page through more with `start` and `end`.
 
+## Options
+
+Start from a ticker or a company name and get the chain, then drill into one contract. The chain gives you each contract's ticker, and the SDK builds one from its parts when you address a contract directly.
+
+```python
+chain  = client.options("apple", type="call", max_dte=30)
+prints = client.options_flow("NVDA", min_premium=100_000)
+bars   = client.option_candles("AAPL", strike=205, expiry="2026-06-12", type="call")
+names  = client.options_underlyings()
+```
+
+`options()` returns the live chain: one row per contract with the latest price, implied volatility, greeks, and the volume and premium traded today. `options_flow()` returns individual prints with premium and greeks at print time; omit the underlying to see every name at once. `option_candles()` returns 1 minute bars for a single contract and accepts either an OSI ticker from the chain or the parts, in which case the SDK builds the ticker. Implied volatility and greeks come from our own pricing models.
+
+For live option ticks over the WebSocket, `subscribe_options(["AAPL"])` delivers every AAPL contract on one subscription, parsed into `OptionTick` objects.
+
 ## Find instruments
 
-`catalog()` lists everything you can stream or download. It needs no key and no connection.
+`catalog()` lists everything you can stream or download. It works without an API key.
 
 ```python
 client.catalog()              # every instrument

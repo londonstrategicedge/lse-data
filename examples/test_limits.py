@@ -73,28 +73,40 @@ class Meter:
 
     def __init__(self):
         self.calls = 0
-        self.bytes = 0
+        self.bytes = 0          # client measured response sizes
+        self.billed = 0         # server reported X-Data-Bytes (the real meter)
+        self.last_billed = 0    # X-Data-Bytes of the most recent call
 
     def get(self, table, params, key, timeout=30):
         """One raw GET against /iso/<table>. Returns (status, nbytes, body,
-        seconds). Counts toward the session meter whether it succeeds or 429s,
-        because the server bills the bytes it actually sent back either way."""
+        seconds). Counts toward the session meter whether it succeeds or 429s.
+        Captures the server's X-Data-Bytes header, which is the exact figure
+        the server adds to your monthly 50 GB allowance for this call."""
         qs = urllib.parse.urlencode(params, safe=".,():*")
         url = f"{API_URL}/{table}" + (f"?{qs}" if qs else "")
         req = urllib.request.Request(
             url, headers={"x-api-key": key, "User-Agent": _USER_AGENT}
         )
         t0 = time.perf_counter()
+        headers = {}
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = resp.read()
                 status = resp.status
+                headers = resp.headers
         except urllib.error.HTTPError as e:
             body = e.read()
             status = e.code
+            headers = e.headers or {}
         dt = time.perf_counter() - t0
+        # Prefer the server's own billed figure; fall back to the body length
+        # when the header is absent (e.g. a rate or quota reject before metering).
+        hdr = headers.get("x-data-bytes") if headers else None
+        billed = int(hdr) if hdr and hdr.isdigit() else len(body)
         self.calls += 1
         self.bytes += len(body)
+        self.billed += billed
+        self.last_billed = billed
         return status, len(body), body, dt
 
 
@@ -272,14 +284,19 @@ def check_bytes(meter, key, symbol):
     if status != 200:
         return fail("could not sample a full page", f"HTTP {status}")
     rows = len(json.loads(body))
-    per_call = nbytes
+    # The server's X-Data-Bytes header is the exact amount this call added to
+    # your monthly bucket. It matches the body size, and is what the quota gate
+    # sums (REST downloads + WS streaming) against the 50 GB cap.
+    per_call = meter.last_billed
     allowance = 50 * 1024 ** 3
     calls_in_quota = allowance // per_call if per_call else 0
-    ok("byte size returned per call", f"{rows} rows = {human_bytes(per_call)} in {dt * 1000:.0f} ms")
+    ok("server billed this call", f"{rows} rows, X-Data-Bytes = {per_call:,} ({human_bytes(per_call)})")
+    print(f"  {DIM}that figure is added to your 50 GB; downloads and streaming "
+          f"share the one bucket{OFF}")
     print(f"  {DIM}at this size, 50 GB is about {calls_in_quota:,} full pages "
           f"(~{calls_in_quota * rows:,} rows) before the allowance is spent{OFF}")
-    print(f"  {DIM}note: there is no public endpoint for remaining GB, so this "
-          f"shows billed size, not your live balance{OFF}")
+    print(f"  {DIM}note: no public endpoint exposes your remaining GB, so this "
+          f"shows billed size per call, not your live balance{OFF}")
     return True
 
 
@@ -331,8 +348,8 @@ def main():
     for name, passed in results.items():
         mark = f"{GREEN}PASS{OFF}" if passed else f"{RED}FAIL{OFF}"
         print(f"  {mark}  {name}")
-    print(f"  {DIM}this session metered {meter.calls} calls, "
-          f"{human_bytes(meter.bytes)} of your monthly allowance{OFF}")
+    print(f"  {DIM}this session: {meter.calls} calls, server billed "
+          f"{human_bytes(meter.billed)} against your 50 GB monthly allowance{OFF}")
 
     return 0 if all(results.values()) else 1
 

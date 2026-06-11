@@ -10,11 +10,13 @@ across both.
 import asyncio
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from typing import Callable, Dict, Iterator, List, Optional, Set
 
 import websockets
@@ -32,6 +34,8 @@ _USER_AGENT = "lse-data-sdk (+https://londonstrategicedge.com)"
 # Public instrument catalog (no key required). Lists every downloadable /
 # streamable instrument with its display name and category.
 _CATALOG_URL = "https://londonstrategicedge.com/feed-catalog.json"
+# Public list of every underlying with listed options (no key required).
+_OPTION_UNDERLYINGS_URL = "https://londonstrategicedge.com/option_underlyings.json"
 
 
 class LSEError(Exception):
@@ -77,6 +81,107 @@ class Tick:
     def __repr__(self) -> str:
         r = " REPLAY" if self.replay else ""
         return f"Tick({self.symbol} {self.price}{r})"
+
+
+# OSI contract symbol, as the feed publishes it (no "O:" prefix):
+# root (1-10 chars) + YYMMDD + C/P + strike*1000 zero-padded to 8 digits.
+_OSI_RE = re.compile(r"^([A-Z][A-Z0-9.]{0,9})(\d{6})([CP])(\d{8})$")
+
+
+@dataclass(repr=False)
+class OptionTick(Tick):
+    """A tick for a single option contract.
+
+    Subclass of :class:`Tick`, so existing code keeps working, with the OSI
+    symbol parsed into named fields. ``premium`` is an alias of ``price``;
+    ``notional`` is ``price * volume * 100`` (the US equity option
+    multiplier), i.e. the dollar value that traded in this tick.
+    """
+    underlying: str = ""
+    right: str = ""            # "call" or "put"
+    strike: float = 0.0
+    expiry: Optional[date] = None
+
+    @property
+    def premium(self) -> float:
+        return self.price
+
+    @property
+    def dte(self) -> Optional[int]:
+        """Calendar days until expiry (0 on expiry day), or None."""
+        if self.expiry is None:
+            return None
+        return (self.expiry - date.today()).days
+
+    @property
+    def notional(self) -> Optional[float]:
+        """Dollar value traded in this tick, or None when volume is absent."""
+        if self.volume is None:
+            return None
+        return round(self.price * self.volume * 100, 2)
+
+    @classmethod
+    def from_symbol(cls, **kwargs) -> "Tick":
+        """Build an OptionTick when ``symbol`` is an OSI contract, else a Tick."""
+        m = _OSI_RE.match(kwargs.get("symbol", ""))
+        if not m:
+            return Tick(**kwargs)
+        root, yymmdd, cp, strike_raw = m.groups()
+        try:
+            expiry = date(2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
+        except ValueError:
+            return Tick(**kwargs)
+        return cls(underlying=root, right="call" if cp == "C" else "put",
+                   strike=int(strike_raw) / 1000.0, expiry=expiry, **kwargs)
+
+    def __repr__(self) -> str:
+        r = " REPLAY" if self.replay else ""
+        return (f"OptionTick(underlying='{self.underlying}', right='{self.right}', "
+                f"strike={self.strike:g}, expiry='{self.expiry}', dte={self.dte}, "
+                f"premium={self.price}, volume={self.volume}, notional={self.notional}{r})")
+
+
+def tape(stream=None):
+    """Return a tick callback that prints an aligned, human-readable table.
+
+    Option ticks render as columns (time, underlying, type, strike, expiry,
+    DTE, premium, volume, notional); other ticks as a plain price line. The
+    header prints once, before the first option row.
+
+    Example:
+        client.subscribe_options(["AAPL"])
+        client.on("tick", tape())
+        client.connect()
+    """
+    import sys as _sys
+    out = stream or _sys.stdout
+    state = {"header": False}
+
+    def _t(tick):
+        # Show when the trade printed (the tick's own timestamp), not when this
+        # row was drawn. They differ for replay/historical ticks; for a live
+        # feed they are within a second. Fall back to now if no timestamp.
+        dt = tick.datetime
+        return (dt or datetime.now()).strftime("%H:%M:%S")
+
+    def _print(tick):
+        if isinstance(tick, OptionTick):
+            if not state["header"]:
+                state["header"] = True
+                hdr = (f"{'TIME':<9} {'UND':<6} {'TYPE':<4} {'STRIKE':>9}  {'EXPIRY':<10}  "
+                       f"{'DTE':>4}  {'PREM':>8}  {'VOL':>6}  {'NOTIONAL':>12}")
+                out.write(hdr + "\n" + "-" * len(hdr) + "\n")
+            vol = int(tick.volume or 0)
+            notional = f"${tick.notional or 0.0:,.0f}"
+            out.write(f"{_t(tick):<9} {tick.underlying:<6} "
+                      f"{'CALL' if tick.right == 'call' else 'PUT':<4} {tick.strike:>9.2f}  "
+                      f"{tick.expiry}  {tick.dte:>3}d  {tick.price:>8.2f}  {vol:>6}  "
+                      f"{notional:>12}\n")
+        else:
+            out.write(f"{_t(tick):<9} {tick.symbol:<13} {tick.price:g}\n")
+        out.flush()
+
+    return _print
 
 
 class LSE:
@@ -549,9 +654,256 @@ class LSE:
             p.append(("effective_date", f"lt.{end}"))
         return self._rest_get("stock_splits", p)
 
+    # ------------------------------------------------------------------
+    # Options data (REST) — chain, flow, per-contract history
+    # ------------------------------------------------------------------
+
+    _OPTION_TYPE_ALIASES = {"c": "call", "call": "call", "calls": "call",
+                            "p": "put", "put": "put", "puts": "put"}
+
+    # numeric columns arrive with full binary float expansion (a price stored
+    # from a float serializes as 2.0299999999999998); round to the precision
+    # the feed actually quotes.
+    _OPTION_ROUND = {"last_price": 4, "premium": 2, "premium_today": 2,
+                     "underlying_price": 4, "iv": 4, "iv_avg": 4,
+                     "delta": 4, "delta_avg": 4, "gamma": 6, "gamma_avg": 6,
+                     "theta": 4, "theta_avg": 4, "vega": 4, "vega_avg": 4,
+                     "rho": 4, "rho_avg": 4, "open": 4, "high": 4, "low": 4,
+                     "close": 4}
+
+    @classmethod
+    def _clean_option_rows(cls, rows: List[dict]) -> List[dict]:
+        for r in rows:
+            for k, nd in cls._OPTION_ROUND.items():
+                v = r.get(k)
+                if isinstance(v, float):
+                    r[k] = round(v, nd)
+        return rows
+
+    def _resolve_underlying(self, query: str) -> str:
+        """Accept a ticker in any case ("AAPL", "aapl") or a company name
+        ("apple", "Nvidia") and return the ticker. A string that matches a
+        catalog symbol always wins; otherwise the closest catalog name match
+        is used (prefix matches first, then the shortest name, so "apple"
+        resolves to Apple Inc. rather than Apple Hospitality REIT)."""
+        q = (query or "").strip()
+        if not q:
+            raise LSEError(400, "underlying is required")
+        try:
+            items = self.catalog()
+        except Exception:
+            # Catalog briefly unreachable: assume the caller passed a ticker.
+            return q.upper()
+        if q.upper() in {x.get("symbol", "").upper() for x in items}:
+            return q.upper()
+        ql = q.lower()
+        hits = [x for x in items if ql in (x.get("name") or "").lower()]
+        if not hits:
+            return q.upper()
+        hits.sort(key=lambda x: (not x["name"].lower().startswith(ql), len(x["name"])))
+        return hits[0]["symbol"]
+
+    def _resolve_contract(self, contract: str, strike=None, expiry=None,
+                          type: Optional[str] = None) -> str:
+        """Return an OSI contract ticker. Either `contract` already is one,
+        or it is an underlying and strike + expiry + type spell out the rest."""
+        if strike is None and expiry is None and type is None:
+            osi = contract.strip().upper()
+            if not _OSI_RE.match(osi):
+                raise LSEError(400,
+                    f"'{contract}' is not an option contract; pass an OSI ticker "
+                    "like AAPL260612C00205000, or an underlying plus "
+                    "strike=, expiry=, type=")
+            return osi
+        if strike is None or expiry is None or type is None:
+            raise LSEError(400, "strike, expiry and type are all required "
+                                "when addressing a contract by its parts")
+        right = self._OPTION_TYPE_ALIASES.get(str(type).lower())
+        if not right:
+            raise LSEError(400, f"type must be 'call' or 'put', got '{type}'")
+        exp = date.fromisoformat(str(expiry)) if not isinstance(expiry, date) else expiry
+        root = self._resolve_underlying(contract)
+        return (f"{root}{exp.strftime('%y%m%d')}"
+                f"{'C' if right == 'call' else 'P'}{int(round(float(strike) * 1000)):08d}")
+
+    def options(self, underlying: str, type: Optional[str] = None,
+                expiry: Optional[str] = None, strike=None,
+                min_dte: Optional[int] = None, max_dte: Optional[int] = None,
+                limit: int = 5000) -> List[dict]:
+        """The current option chain for an underlying: one row per contract
+        with the latest traded price, implied volatility, greeks, and today's
+        volume and premium totals. Refreshed continuously while the market is
+        open. Each row carries its OSI ticker, ready for option_candles() or
+        subscribe_options() drill down.
+
+        underlying: ticker or company name ("AAPL", "apple", "Nvidia").
+        type:       "call" or "put" (default both).
+        expiry:     one expiry date, e.g. "2026-06-19".
+        strike:     one strike (205) or an inclusive (low, high) window.
+        min_dte / max_dte: days-to-expiry window.
+
+        Example:
+            chain = client.options("apple", type="call", max_dte=30)
+            near = client.options("NVDA", expiry="2026-06-19", strike=(180, 220))
+        """
+        sym = self._resolve_underlying(underlying)
+        p: List[tuple] = [("underlying", f"eq.{sym}"),
+                          ("order", "expiry.asc,strike.asc"),
+                          ("limit", str(min(int(limit), 5000)))]
+        if type:
+            right = self._OPTION_TYPE_ALIASES.get(str(type).lower())
+            if not right:
+                raise LSEError(400, f"type must be 'call' or 'put', got '{type}'")
+            p.append(("contract_type", f"eq.{right}"))
+        if expiry:
+            p.append(("expiry", f"eq.{expiry}"))
+        if strike is not None:
+            if isinstance(strike, (tuple, list)):
+                p.append(("strike", f"gte.{strike[0]}"))
+                p.append(("strike", f"lte.{strike[1]}"))
+            else:
+                p.append(("strike", f"eq.{strike}"))
+        if min_dte is not None:
+            p.append(("dte", f"gte.{int(min_dte)}"))
+        if max_dte is not None:
+            p.append(("dte", f"lte.{int(max_dte)}"))
+        return self._clean_option_rows(self._rest_get("x_options_chain", p))
+
+    def options_flow(self, underlying: Optional[str] = None,
+                     type: Optional[str] = None,
+                     min_premium: Optional[float] = None,
+                     expiry: Optional[str] = None,
+                     max_dte: Optional[int] = None,
+                     start: Optional[str] = None, end: Optional[str] = None,
+                     order: str = "desc", limit: int = 5000) -> List[dict]:
+        """Recent option prints (time and sales): every trade with its
+        premium, IV and greeks at print time. Covers the trailing week;
+        older history is served as 1 minute bars by option_candles().
+
+        Omit underlying to sweep the whole tape, e.g. every print above
+        $250k premium across all names.
+
+        Example:
+            client.options_flow("apple", min_premium=100_000)
+            client.options_flow(type="put", min_premium=250_000, max_dte=7)
+        """
+        p: List[tuple] = [("order", f"ts.{order}"),
+                          ("limit", str(min(int(limit), 5000)))]
+        if underlying:
+            p.append(("underlying", f"eq.{self._resolve_underlying(underlying)}"))
+        if type:
+            right = self._OPTION_TYPE_ALIASES.get(str(type).lower())
+            if not right:
+                raise LSEError(400, f"type must be 'call' or 'put', got '{type}'")
+            p.append(("contract_type", f"eq.{right}"))
+        if min_premium is not None:
+            p.append(("premium", f"gte.{min_premium}"))
+        if expiry:
+            p.append(("expiry", f"eq.{expiry}"))
+        if max_dte is not None:
+            p.append(("dte", f"lte.{int(max_dte)}"))
+        if start:
+            p.append(("ts", f"gte.{start}"))
+        if end:
+            p.append(("ts", f"lt.{end}"))
+        return self._clean_option_rows(self._rest_get("x_options_flow", p))
+
+    @staticmethod
+    def _bars_from_prints(prints: List[dict]) -> List[dict]:
+        """Fold raw prints into 1 minute bars with the same shape and
+        semantics as the server's nightly compaction (epoch-floored minutes,
+        OHLC on last_price ordered by ts, summed volume/premium, averaged
+        greeks), so archive bars and freshly built bars are indistinguishable."""
+        buckets: Dict[int, List[dict]] = {}
+        for r in prints:
+            try:
+                ts = datetime.fromisoformat(str(r["ts"]).replace("Z", "+00:00"))
+            except (ValueError, TypeError, KeyError):
+                continue
+            buckets.setdefault(int(ts.timestamp()) // 60 * 60, []).append(r)
+        bars = []
+        for epoch in sorted(buckets):
+            rows = buckets[epoch]
+            rows.sort(key=lambda r: r["ts"])
+            first = rows[0]
+
+            def avg(col):
+                vals = [r[col] for r in rows if r.get(col) is not None]
+                return sum(vals) / len(vals) if vals else None
+
+            bars.append({
+                "ticker": first["ticker"], "underlying": first["underlying"],
+                "strike": first["strike"], "expiry": first["expiry"],
+                "contract_type": first["contract_type"],
+                "minute": datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
+                "dte": first.get("dte"),
+                "open": rows[0]["last_price"], "high": max(r["last_price"] for r in rows),
+                "low": min(r["last_price"] for r in rows), "close": rows[-1]["last_price"],
+                "volume": sum(r["volume"] for r in rows),
+                "premium": sum(r["premium"] for r in rows),
+                "print_count": len(rows),
+                "iv_avg": avg("iv"), "delta_avg": avg("delta"),
+                "gamma_avg": avg("gamma"), "theta_avg": avg("theta"),
+                "vega_avg": avg("vega"), "rho_avg": avg("rho"),
+                "underlying_price": avg("underlying_price"),
+            })
+        return bars
+
+    def option_candles(self, contract: str, strike=None, expiry=None,
+                       type: Optional[str] = None,
+                       start: Optional[str] = None, end: Optional[str] = None,
+                       order: str = "asc", limit: int = 5000) -> List[dict]:
+        """1 minute premium OHLC history for one contract, with volume,
+        premium and averaged greeks per bar.
+
+        Address the contract either way:
+            client.option_candles("AAPL260612C00205000")
+            client.option_candles("AAPL", strike=205, expiry="2026-06-12", type="call")
+
+        Bars older than about a week come from the compacted archive; the
+        trailing week is folded from raw prints on the fly, so recent bars
+        always agree with options_flow(). For very active contracts narrow
+        the window with start/end (the print fetch behind recent bars is
+        capped at 5,000 rows per call).
+        """
+        osi = self._resolve_contract(contract, strike=strike, expiry=expiry, type=type)
+        lim = min(int(limit), 5000)
+
+        p: List[tuple] = [("ticker", f"eq.{osi}"), ("order", f"minute.{order}"),
+                          ("limit", str(lim))]
+        if start:
+            p.append(("minute", f"gte.{start}"))
+        if end:
+            p.append(("minute", f"lt.{end}"))
+        archive = self._rest_get("x_options_flow_1m", p)
+
+        q: List[tuple] = [("ticker", f"eq.{osi}"), ("order", "ts.asc"),
+                          ("limit", "5000")]
+        if start:
+            q.append(("ts", f"gte.{start}"))
+        if end:
+            q.append(("ts", f"lt.{end}"))
+        recent = self._bars_from_prints(self._rest_get("x_options_flow", q))
+
+        # The archive only holds bars older than the compaction window and
+        # prints only cover the trailing week, so the two never overlap.
+        merged = archive + recent
+        merged.sort(key=lambda b: datetime.fromisoformat(str(b["minute"]).replace("Z", "+00:00")),
+                    reverse=(order == "desc"))
+        return self._clean_option_rows(merged[:lim])
+
+    def options_underlyings(self) -> List[dict]:
+        """Every underlying with listed options, as [{"symbol", "name"}, ...].
+        No key required. Feed any entry straight into options(),
+        options_flow() or subscribe_options()."""
+        req = urllib.request.Request(_OPTION_UNDERLYINGS_URL,
+                                     headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(req, timeout=self._rest_timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     def get(self, table: str, **filters) -> List[dict]:
         """Generic download: any downloadable table with raw query filters.
-        Options and company profiles are not downloadable and return an error.
+        Company profiles are not downloadable and return an error.
 
         Example:
             client.get("z_insider_trades", symbol="eq.AAPL", limit="10")
@@ -684,9 +1036,15 @@ class LSE:
                         self._symbols = msg.get("symbols", [])
                         self._emit("authenticated")
 
-                        # Subscribe to requested symbols
+                        # Subscribe to requested symbols: the connect()/stream()
+                        # argument PLUS anything added via subscribe() (before
+                        # connect, or mid-session before a reconnect). Both live
+                        # in _subscriptions, so replaying the whole set fixes
+                        # subscribe()-before-connect and restores subscriptions
+                        # after a reconnect, mirroring _option_underlyings below.
                         for sym in symbols:
                             self._subscriptions.add(sym)
+                        for sym in self._subscriptions:
                             sub_msg = {"action": "subscribe", "symbol": sym}
                             if start:
                                 sub_msg["start"] = start
@@ -702,7 +1060,10 @@ class LSE:
                             }))
 
                     elif msg_type == "tick":
-                        tick = Tick(
+                        # Option contracts arrive with OSI symbols; from_symbol
+                        # upgrades those to OptionTick (parsed strike/expiry/right)
+                        # and returns a plain Tick for everything else.
+                        tick = OptionTick.from_symbol(
                             symbol=msg.get("symbol", ""),
                             price=msg.get("price", 0.0),
                             bid=msg.get("bid"),
