@@ -39,6 +39,6 @@ if chain:
         print(f"  {b['minute']}  o {b['open']} h {b['high']} l {b['low']} c {b['close']}"
               f"  vol {b['volume']}")
 
-# Discovery without a key: every underlying that has listed options.
+# Discovery: every underlying that has listed options.
 names = client.options_underlyings()
 print(f"{len(names)} option underlyings available")

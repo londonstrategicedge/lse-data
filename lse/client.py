@@ -2,9 +2,11 @@
 LSE market data client: live streaming over WebSocket and historical
 download over REST, both authorized by the same API key.
 
-Streaming connects to wss://data-ws.londonstrategicedge.com; download calls
-https://api.londonstrategicedge.com. One key, one monthly data allowance shared
-across both.
+Streaming connects to wss://data-ws.londonstrategicedge.com. Every REST read
+(candles, reference data, options, catalog, deep history) is served from the
+LSE vault at https://api.londonstrategicedge.com/vault: synchronous JSON row
+queries for interactive pulls, async Parquet export jobs for bulk history
+(see lse.vault). One key authorizes everything.
 """
 
 import asyncio
@@ -16,26 +18,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Callable, Dict, Iterator, List, Optional, Set
 
 import websockets
 import websockets.client
 
+from .vault import VaultMixin
+
 
 WS_URL = "wss://data-ws.londonstrategicedge.com"
-# REST download base. The same key authorizes streaming and download; the server
-# caps each call at 5,000 rows and 100 calls/min and meters response bytes
-# against the same monthly allowance as streaming.
+# Legacy /iso REST base (PostgREST grammar). Not called by this client any more:
+# every REST read goes to the vault (lse.vault.VAULT_URL). The constant remains so
+# older scripts importing it keep working against the still-live legacy endpoint.
 API_URL = "https://api.londonstrategicedge.com/iso"
 # The download host is behind a CDN that blocks the default Python-urllib
 # User-Agent. Send our own so requests are not bounced before reaching the API.
 _USER_AGENT = "lse-data-sdk (+https://londonstrategicedge.com)"
-# Public instrument catalog (no key required). Lists every downloadable /
-# streamable instrument with its display name and category.
-_CATALOG_URL = "https://londonstrategicedge.com/feed-catalog.json"
-# Public list of every underlying with listed options (no key required).
-_OPTION_UNDERLYINGS_URL = "https://londonstrategicedge.com/option_underlyings.json"
 
 
 class LSEError(Exception):
@@ -184,13 +183,16 @@ def tape(stream=None):
     return _print
 
 
-class LSE:
-    """Client for London Strategic Edge real-time market data.
+class LSE(VaultMixin):
+    """Client for London Strategic Edge market data: live streaming, REST
+    download, and deep vault history (see :mod:`lse.vault`).
 
     Args:
         api_key: Your LSE API key. Get one at https://londonstrategicedge.com/data
                  If omitted, the LSE_API_KEY environment variable is used.
         url: WebSocket endpoint. Defaults to the production server.
+        timeout: Seconds to wait for each REST call (default 60). Raise it for
+                 the heaviest queries, e.g. LSE(api_key=..., timeout=120).
 
     Works as a context manager (``with LSE(...) as client:``), disconnecting
     on exit.
@@ -234,7 +236,8 @@ class LSE:
             client.connect()
     """
 
-    def __init__(self, api_key: Optional[str] = None, url: str = WS_URL):
+    def __init__(self, api_key: Optional[str] = None, url: str = WS_URL,
+                 timeout: float = 60):
         api_key = api_key or os.environ.get("LSE_API_KEY")
         if not api_key:
             raise ValueError(
@@ -257,8 +260,10 @@ class LSE:
         self._disconnect_requested = False
         # Reference to the event loop running _run_forever, used by disconnect()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Timeout (seconds) for REST download calls.
-        self._rest_timeout = 30
+        # Timeout (seconds) for REST calls. Defaults to 60 because the deepest
+        # vault queries (for example 1s candles over a long span) can take tens
+        # of seconds server side; 30s was cutting them off mid-read.
+        self._rest_timeout = timeout
         # Cached instrument catalog (fetched once, on first catalog() call).
         self._catalog_cache: Optional[List[dict]] = None
 
@@ -281,7 +286,7 @@ class LSE:
 
     @property
     def tier(self) -> str:
-        """Account tier (e.g. 'basic', 'pro')."""
+        """Account tier as reported by the server (e.g. 'registered')."""
         return self._tier
 
     @property
@@ -519,76 +524,95 @@ class LSE:
                     pass
 
     # ------------------------------------------------------------------
-    # REST data download (historical) — same key as streaming
+    # REST data download (historical) — same key as streaming. Every read here
+    # is a synchronous JSON row query against the vault; bulk pulls are the
+    # async Parquet exports in lse.vault (history()/dataset()).
     # ------------------------------------------------------------------
+
+    # Vault row queries return UTC times as "YYYY-MM-DD hh:mm:ss[.ffffff]".
+    # Normalise to ISO-8601 with an explicit Z so downstream parsers see an
+    # unambiguous, timezone-aware string.
+    _TIME_KEYS = {"timestamp", "ts", "minute", "datetime", "last_trade_at",
+                  "updated_at", "created_at", "accepted_date", "fetched_at"}
+
+    @classmethod
+    def _isoify(cls, rows: List[dict]) -> List[dict]:
+        for r in rows:
+            for k in cls._TIME_KEYS:
+                v = r.get(k)
+                if isinstance(v, str) and len(v) >= 19 and v[10] == " ":
+                    r[k] = v.replace(" ", "T", 1) + "Z"
+        return rows
 
     @staticmethod
     def _symbol_slug(symbol: str) -> str:
         return symbol.lower().replace("/", "_").replace("-", "_").replace(".", "_")
 
-    def _rest_get(self, table: str, params: List[tuple]) -> List[dict]:
-        """GET /iso/<table> with the API key. `params` is a list of (key, value)
-        tuples so a column can repeat (the API ANDs repeated filters, e.g. a
-        gte and an lt on timestamp). Returns a list of row dicts; raises
-        LSEError on any non-2xx response or API error body."""
-        # Keep filter operator punctuation (. , ( ) : *) unescaped.
-        qs = urllib.parse.urlencode(params, safe=".,():*")
-        url = f"{API_URL}/{table}" + (f"?{qs}" if qs else "")
+    def _vault_rows(self, path: str, params: List[tuple]) -> List[dict]:
+        """GET a synchronous vault query endpoint with the API key; returns row
+        dicts. Raises LSEError on any non-2xx (bad filter, over quota, rate
+        limited)."""
+        from .vault import VAULT_URL
+        qs = urllib.parse.urlencode([(k, str(v)) for k, v in params if v is not None])
+        url = f"{VAULT_URL}{path}" + (f"?{qs}" if qs else "")
         req = urllib.request.Request(url, headers={
             "x-api-key": self._api_key,
             "User-Agent": _USER_AGENT,
         })
         try:
             with urllib.request.urlopen(req, timeout=self._rest_timeout) as resp:
-                body = resp.read().decode("utf-8")
+                return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
             msg = raw
             try:
                 j = json.loads(raw)
-                msg = j.get("message") or j.get("error") or raw
+                msg = j.get("detail") or j.get("message") or raw
             except Exception:
                 pass
-            raise LSEError(e.code, msg)
-        data = json.loads(body)
-        if isinstance(data, dict) and data.get("code") and "message" in data:
-            raise LSEError(400, data["message"])
-        return data
+            raise LSEError(e.code, str(msg)[:300])
+        except OSError as e:
+            # Timeouts and transport failures must also surface as LSEError so
+            # one except clause covers every failed call; URLError and
+            # TimeoutError are both OSError subclasses. status 0 = no HTTP
+            # response was received.
+            raise LSEError(0, "request failed before an HTTP response: "
+                              f"{getattr(e, 'reason', None) or e}")
 
     def candles(self, symbol: str, timeframe: str = "1m", start: Optional[str] = None,
-                end: Optional[str] = None, limit: int = 5000, order: str = "asc") -> List[dict]:
-        """Historical OHLCV candles for any non-option instrument (stocks, FX,
-        crypto, commodities, indices, ETFs).
+                end: Optional[str] = None, limit: int = 5000, order: str = "asc",
+                dataset: Optional[str] = None) -> List[dict]:
+        """Historical OHLCV candles for any non-option instrument, straight from
+        the vault (stocks back to 2003, FX to 2009, crypto to 2017).
 
-        timeframe: "1m", "5m", "15m", "1h", "4h", or "1d".
+        timeframe: any vault resolution: "1s", "5s", "15s", "30s", "1m", "3m",
+        "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1mo".
         start / end: ISO timestamps (e.g. "2026-01-01") filtering the bar time.
-        The server caps each call at 5,000 rows; page with start/end for more.
+        Page with start/end for longer ranges; each call returns at most the
+        plan's row cap. dataset pins the asset class when a symbol exists in
+        more than one (rarely needed).
 
         Example:
             client.candles("BTC/USD", "1d", start="2026-01-01")
             client.candles("AAPL", "1h", limit=200, order="desc")
+            client.candles("EUR/USD", "5s", start="2026-07-01", end="2026-07-02")
         """
-        tf = timeframe.lower()
-        p: List[tuple] = [("order", f"timestamp.{order}"), ("limit", str(min(int(limit), 5000)))]
-        if start:
-            p.append(("timestamp", f"gte.{start}"))
-        if end:
-            p.append(("timestamp", f"lt.{end}"))
-        htf = {"5m": "x_candles_5m", "15m": "x_candles_15m", "1h": "x_candles_1h",
-               "4h": "x_candles_4h", "1d": "x_candles_1d"}
-        if tf in htf:
-            return self._rest_get(htf[tf], [("symbol", f"eq.{symbol}")] + p)
-        if tf == "1m":
-            # Per-symbol 1m table: most instruments use candles_<sym>; US stocks
-            # and ETFs use d_candles_<sym>. Try the common one, fall back on 404.
-            slug = self._symbol_slug(symbol)
-            try:
-                return self._rest_get(f"candles_{slug}", p)
-            except LSEError as e:
-                if e.status == 404:
-                    return self._rest_get(f"d_candles_{slug}", p)
-                raise
-        raise LSEError(400, f"unsupported timeframe '{timeframe}' (use 1m/5m/15m/1h/4h/1d)")
+        p: List[tuple] = [("symbol", symbol), ("timeframe", str(timeframe).lower()),
+                          ("order", order), ("limit", min(int(limit), 5000)),
+                          ("dataset", dataset), ("start", start), ("end", end)]
+        rows = self._vault_rows("/candles", p)
+        for r in rows:
+            # The vault labels the bar-open time `ts`; this API has always said
+            # `timestamp`, so keep that contract.
+            if "ts" in r:
+                r["timestamp"] = r.pop("ts")
+            r.setdefault("volume", 0.0)  # fx candles carry no consolidated volume
+        return self._isoify(rows)
+
+    def _ref_rows(self, dataset: str, extra: List[tuple], start, end, order, limit) -> List[dict]:
+        p: List[tuple] = list(extra) + [("start", start), ("end", end),
+                                        ("order", order), ("limit", min(int(limit), 5000))]
+        return self._isoify(self._vault_rows(f"/ref/{dataset}", p))
 
     def economic_calendar(self, region=None, event: Optional[str] = None,
                           start: Optional[str] = None, end: Optional[str] = None,
@@ -597,62 +621,88 @@ class LSE:
         """Macro economic events (CPI, NFP, rate decisions, GDP, ...).
         region: a code like "US" or a list like ["US","EU","GB"].
         released_only: only events whose `actual` has printed."""
-        p: List[tuple] = [("is_stale", "is.false"), ("order", f"datetime.{order}"),
-                          ("limit", str(min(int(limit), 5000)))]
-        if region is not None:
-            if isinstance(region, (list, tuple, set)):
-                p.append(("region_code", f"in.({','.join(region)})"))
-            else:
-                p.append(("region_code", f"eq.{region}"))
-        if event:
-            p.append(("event", f"ilike.*{event}*"))
-        if start:
-            p.append(("datetime", f"gte.{start}"))
-        if end:
-            p.append(("datetime", f"lt.{end}"))
-        if released_only:
-            p.append(("actual", "not.is.null"))
-        return self._rest_get("economic_calender", p)
+        if isinstance(region, (list, tuple, set)):
+            region = ",".join(region)
+        extra = [("region", region), ("event", event),
+                 ("released", 1 if released_only else None)]
+        return self._ref_rows("economic_calendar", extra, start, end, order, limit)
 
     def insider_trades(self, symbol: Optional[str] = None, type: Optional[str] = None,
                        start: Optional[str] = None, end: Optional[str] = None,
                        order: str = "desc", limit: int = 5000) -> List[dict]:
         """SEC Form 3/4/5 insider transactions. `type` is an SEC code, e.g.
         "P-Purchase" or "S-Sale"; start/end filter `transaction_date`."""
-        p: List[tuple] = [("order", f"transaction_date.{order}"), ("limit", str(min(int(limit), 5000)))]
-        if symbol:
-            p.append(("symbol", f"eq.{symbol}"))
-        if type:
-            p.append(("transaction_type", f"eq.{type}"))
-        if start:
-            p.append(("transaction_date", f"gte.{start}"))
-        if end:
-            p.append(("transaction_date", f"lt.{end}"))
-        return self._rest_get("z_insider_trades", p)
+        return self._ref_rows("insider_trades", [("symbol", symbol), ("type", type)],
+                              start, end, order, limit)
 
     def dividends(self, symbol: Optional[str] = None, start: Optional[str] = None,
                   end: Optional[str] = None, order: str = "desc", limit: int = 5000) -> List[dict]:
         """Dividend events; start/end filter the ex-date (`effective_date`)."""
-        p: List[tuple] = [("order", f"effective_date.{order}"), ("limit", str(min(int(limit), 5000)))]
-        if symbol:
-            p.append(("symbol", f"eq.{symbol}"))
-        if start:
-            p.append(("effective_date", f"gte.{start}"))
-        if end:
-            p.append(("effective_date", f"lt.{end}"))
-        return self._rest_get("dividends", p)
+        return self._ref_rows("dividends", [("symbol", symbol)], start, end, order, limit)
 
     def splits(self, symbol: Optional[str] = None, start: Optional[str] = None,
                end: Optional[str] = None, order: str = "desc", limit: int = 5000) -> List[dict]:
         """Stock split events; start/end filter `effective_date`."""
-        p: List[tuple] = [("order", f"effective_date.{order}"), ("limit", str(min(int(limit), 5000)))]
-        if symbol:
-            p.append(("symbol", f"eq.{symbol}"))
-        if start:
-            p.append(("effective_date", f"gte.{start}"))
-        if end:
-            p.append(("effective_date", f"lt.{end}"))
-        return self._rest_get("stock_splits", p)
+        return self._ref_rows("stock_splits", [("symbol", symbol)], start, end, order, limit)
+
+    def series(self, symbol: str, dataset: Optional[str] = None,
+               start: Optional[str] = None, end: Optional[str] = None,
+               order: str = "asc", limit: int = 5000) -> List[dict]:
+        """One (date, value) observation series from the vault: any macro
+        economics series or a bond yield tenor, and every series-shaped
+        dataset added later. The class resolves from the catalog, so
+        ``series("cpi_yoy")`` and ``series("US10Y")`` both just work.
+
+        Example:
+            client.series("cpi_yoy")                       # US inflation rate
+            client.series("fdtr", start="1980-01-01")      # Fed funds since 1980
+            client.series("DE10Y", order="desc", limit=30)
+        """
+        p: List[tuple] = [("symbol", symbol), ("dataset", dataset),
+                          ("start", start), ("end", end),
+                          ("order", order), ("limit", min(int(limit), 5000))]
+        return self._vault_rows("/series", p)
+
+    def cot(self, symbol: Optional[str] = None, start: Optional[str] = None,
+            end: Optional[str] = None, order: str = "asc", limit: int = 5000) -> List[dict]:
+        """CFTC Commitments of Traders: weekly positioning per futures market
+        (commercial, non-commercial and non-reportable longs/shorts, open
+        interest, week-over-week changes)."""
+        return self._ref_rows("cot", [("symbol", symbol)], start, end, order, limit)
+
+    def financial_reports(self, symbol: Optional[str] = None,
+                          report_type: Optional[str] = None, period: Optional[str] = None,
+                          start: Optional[str] = None, end: Optional[str] = None,
+                          order: str = "desc", limit: int = 5000) -> List[dict]:
+        """Company financial statements. report_type: "income", "balance" or
+        "cashflow"; period: "FY" or a quarter like "Q1". Each row's `data` field
+        holds the full statement and is returned parsed."""
+        rows = self._ref_rows("financial_reports",
+                              [("symbol", symbol), ("report_type", report_type),
+                               ("period", period)], start, end, order, limit)
+        for r in rows:
+            if isinstance(r.get("data"), str):
+                try:
+                    r["data"] = json.loads(r["data"])
+                except ValueError:
+                    pass
+        return rows
+
+    def company_profiles(self, symbol: Optional[str] = None, limit: int = 5000) -> List[dict]:
+        """Company reference profiles (sector, industry, description, listing
+        details). Omit symbol for the whole set."""
+        return self._ref_rows("company_profiles", [("symbol", symbol)], None, None, "asc", limit)
+
+    def fundamentals(self, symbol: Optional[str] = None, limit: int = 5000) -> List[dict]:
+        """Snapshot fundamentals per stock (market cap, PE, margins, 52 week
+        range, dividend yield)."""
+        return self._ref_rows("stock_fundamentals", [("symbol", symbol)], None, None, "asc", limit)
+
+    def bond_yields(self, symbol: Optional[str] = None, start: Optional[str] = None,
+                    end: Optional[str] = None, order: str = "asc", limit: int = 5000) -> List[dict]:
+        """Government bond yield history (daily OHLC per tenor symbol, e.g.
+        "US10Y", 31 countries back to 1990)."""
+        return self._ref_rows("bond_yields", [("symbol", symbol)], start, end, order, limit)
 
     # ------------------------------------------------------------------
     # Options data (REST) — chain, flow, per-contract history
@@ -683,9 +733,11 @@ class LSE:
     def _resolve_underlying(self, query: str) -> str:
         """Accept a ticker in any case ("AAPL", "aapl") or a company name
         ("apple", "Nvidia") and return the ticker. A string that matches a
-        catalog symbol always wins; otherwise the closest catalog name match
-        is used (prefix matches first, then the shortest name, so "apple"
-        resolves to Apple Inc. rather than Apple Hospitality REIT)."""
+        catalog symbol always wins; otherwise the closest match among the
+        optionable underlyings is used (prefix matches first, then the
+        shortest name, so "apple" resolves to Apple Inc. rather than Apple
+        Hospitality REIT). Name matching is restricted to the options dataset
+        so an economics series can never shadow a company."""
         q = (query or "").strip()
         if not q:
             raise LSEError(400, "underlying is required")
@@ -697,7 +749,8 @@ class LSE:
         if q.upper() in {x.get("symbol", "").upper() for x in items}:
             return q.upper()
         ql = q.lower()
-        hits = [x for x in items if ql in (x.get("name") or "").lower()]
+        pool = [x for x in items if x.get("dataset") == "options"] or items
+        hits = [x for x in pool if ql in (x.get("name") or "").lower()]
         if not hits:
             return q.upper()
         hits.sort(key=lambda x: (not x["name"].lower().startswith(ql), len(x["name"])))
@@ -747,27 +800,25 @@ class LSE:
             near = client.options("NVDA", expiry="2026-06-19", strike=(180, 220))
         """
         sym = self._resolve_underlying(underlying)
-        p: List[tuple] = [("underlying", f"eq.{sym}"),
-                          ("order", "expiry.asc,strike.asc"),
-                          ("limit", str(min(int(limit), 5000)))]
+        p: List[tuple] = [("underlying", sym), ("limit", min(int(limit), 5000))]
         if type:
             right = self._OPTION_TYPE_ALIASES.get(str(type).lower())
             if not right:
                 raise LSEError(400, f"type must be 'call' or 'put', got '{type}'")
-            p.append(("contract_type", f"eq.{right}"))
+            p.append(("type", right))
         if expiry:
-            p.append(("expiry", f"eq.{expiry}"))
+            p.append(("expiry", expiry))
         if strike is not None:
             if isinstance(strike, (tuple, list)):
-                p.append(("strike", f"gte.{strike[0]}"))
-                p.append(("strike", f"lte.{strike[1]}"))
+                p.append(("strike_min", strike[0]))
+                p.append(("strike_max", strike[1]))
             else:
-                p.append(("strike", f"eq.{strike}"))
+                p.append(("strike", strike))
         if min_dte is not None:
-            p.append(("dte", f"gte.{int(min_dte)}"))
+            p.append(("min_dte", int(min_dte)))
         if max_dte is not None:
-            p.append(("dte", f"lte.{int(max_dte)}"))
-        return self._clean_option_rows(self._rest_get("x_options_chain", p))
+            p.append(("max_dte", int(max_dte)))
+        return self._clean_option_rows(self._isoify(self._vault_rows("/options/chain", p)))
 
     def options_flow(self, underlying: Optional[str] = None,
                      type: Optional[str] = None,
@@ -787,67 +838,22 @@ class LSE:
             client.options_flow("apple", min_premium=100_000)
             client.options_flow(type="put", min_premium=250_000, max_dte=7)
         """
-        p: List[tuple] = [("order", f"ts.{order}"),
-                          ("limit", str(min(int(limit), 5000)))]
+        p: List[tuple] = [("order", order), ("limit", min(int(limit), 5000)),
+                          ("start", start), ("end", end)]
         if underlying:
-            p.append(("underlying", f"eq.{self._resolve_underlying(underlying)}"))
+            p.append(("underlying", self._resolve_underlying(underlying)))
         if type:
             right = self._OPTION_TYPE_ALIASES.get(str(type).lower())
             if not right:
                 raise LSEError(400, f"type must be 'call' or 'put', got '{type}'")
-            p.append(("contract_type", f"eq.{right}"))
+            p.append(("type", right))
         if min_premium is not None:
-            p.append(("premium", f"gte.{min_premium}"))
+            p.append(("min_premium", min_premium))
         if expiry:
-            p.append(("expiry", f"eq.{expiry}"))
+            p.append(("expiry", expiry))
         if max_dte is not None:
-            p.append(("dte", f"lte.{int(max_dte)}"))
-        if start:
-            p.append(("ts", f"gte.{start}"))
-        if end:
-            p.append(("ts", f"lt.{end}"))
-        return self._clean_option_rows(self._rest_get("x_options_flow", p))
-
-    @staticmethod
-    def _bars_from_prints(prints: List[dict]) -> List[dict]:
-        """Fold raw prints into 1 minute bars with the same shape and
-        semantics as the server's nightly compaction (epoch-floored minutes,
-        OHLC on last_price ordered by ts, summed volume/premium, averaged
-        greeks), so archive bars and freshly built bars are indistinguishable."""
-        buckets: Dict[int, List[dict]] = {}
-        for r in prints:
-            try:
-                ts = datetime.fromisoformat(str(r["ts"]).replace("Z", "+00:00"))
-            except (ValueError, TypeError, KeyError):
-                continue
-            buckets.setdefault(int(ts.timestamp()) // 60 * 60, []).append(r)
-        bars = []
-        for epoch in sorted(buckets):
-            rows = buckets[epoch]
-            rows.sort(key=lambda r: r["ts"])
-            first = rows[0]
-
-            def avg(col):
-                vals = [r[col] for r in rows if r.get(col) is not None]
-                return sum(vals) / len(vals) if vals else None
-
-            bars.append({
-                "ticker": first["ticker"], "underlying": first["underlying"],
-                "strike": first["strike"], "expiry": first["expiry"],
-                "contract_type": first["contract_type"],
-                "minute": datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
-                "dte": first.get("dte"),
-                "open": rows[0]["last_price"], "high": max(r["last_price"] for r in rows),
-                "low": min(r["last_price"] for r in rows), "close": rows[-1]["last_price"],
-                "volume": sum(r["volume"] for r in rows),
-                "premium": sum(r["premium"] for r in rows),
-                "print_count": len(rows),
-                "iv_avg": avg("iv"), "delta_avg": avg("delta"),
-                "gamma_avg": avg("gamma"), "theta_avg": avg("theta"),
-                "vega_avg": avg("vega"), "rho_avg": avg("rho"),
-                "underlying_price": avg("underlying_price"),
-            })
-        return bars
+            p.append(("max_dte", int(max_dte)))
+        return self._clean_option_rows(self._isoify(self._vault_rows("/options/flow", p)))
 
     def option_candles(self, contract: str, strike=None, expiry=None,
                        type: Optional[str] = None,
@@ -860,73 +866,174 @@ class LSE:
             client.option_candles("AAPL260612C00205000")
             client.option_candles("AAPL", strike=205, expiry="2026-06-12", type="call")
 
-        Bars older than about a week come from the compacted archive; the
-        trailing week is folded from raw prints on the fly, so recent bars
-        always agree with options_flow(). For very active contracts narrow
-        the window with start/end (the print fetch behind recent bars is
-        capped at 5,000 rows per call).
+        The vault merges the compacted bar archive with bars folded live from
+        the most recent prints, so the trailing days always agree with
+        options_flow().
         """
         osi = self._resolve_contract(contract, strike=strike, expiry=expiry, type=type)
-        lim = min(int(limit), 5000)
-
-        p: List[tuple] = [("ticker", f"eq.{osi}"), ("order", f"minute.{order}"),
-                          ("limit", str(lim))]
-        if start:
-            p.append(("minute", f"gte.{start}"))
-        if end:
-            p.append(("minute", f"lt.{end}"))
-        archive = self._rest_get("x_options_flow_1m", p)
-
-        q: List[tuple] = [("ticker", f"eq.{osi}"), ("order", "ts.asc"),
-                          ("limit", "5000")]
-        if start:
-            q.append(("ts", f"gte.{start}"))
-        if end:
-            q.append(("ts", f"lt.{end}"))
-        recent = self._bars_from_prints(self._rest_get("x_options_flow", q))
-
-        # The archive only holds bars older than the compaction window and
-        # prints only cover the trailing week, so the two never overlap.
-        merged = archive + recent
-        merged.sort(key=lambda b: datetime.fromisoformat(str(b["minute"]).replace("Z", "+00:00")),
-                    reverse=(order == "desc"))
-        return self._clean_option_rows(merged[:lim])
+        p: List[tuple] = [("ticker", osi), ("order", order),
+                          ("limit", min(int(limit), 5000)),
+                          ("start", start), ("end", end)]
+        return self._clean_option_rows(self._isoify(self._vault_rows("/options/candles", p)))
 
     def options_underlyings(self) -> List[dict]:
-        """Every underlying with listed options, as [{"symbol", "name"}, ...].
-        No key required. Feed any entry straight into options(),
+        """Every underlying with listed options, as [{"symbol", "name"}, ...],
+        from the vault catalog. Feed any entry straight into options(),
         options_flow() or subscribe_options()."""
-        req = urllib.request.Request(_OPTION_UNDERLYINGS_URL,
-                                     headers={"User-Agent": _USER_AGENT})
-        with urllib.request.urlopen(req, timeout=self._rest_timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return [{"symbol": r["symbol"], "name": r.get("name") or ""}
+                for r in self.datasets("options")]
+
+    _LEGACY_HTF = {"x_candles_5m": "5m", "x_candles_15m": "15m", "x_candles_1h": "1h",
+                   "x_candles_4h": "4h", "x_candles_1d": "1d"}
+
+    def _symbol_from_slug(self, slug: str) -> str:
+        for x in self.catalog():
+            if self._symbol_slug(x["symbol"]) == slug:
+                return x["symbol"]
+        raise LSEError(404, f"no instrument matches '{slug}'")
 
     def get(self, table: str, **filters) -> List[dict]:
-        """Generic download: any downloadable table with raw query filters.
-        Company profiles are not downloadable and return an error.
+        """Legacy escape hatch, kept for compatibility: accepts the previously
+        documented table names with PostgREST-style filters and maps them onto
+        the vault query endpoints. New code should call the named methods
+        (candles, insider_trades, options, ...) directly.
 
         Example:
             client.get("z_insider_trades", symbol="eq.AAPL", limit="10")
         """
-        return self._rest_get(table, [(k, str(v)) for k, v in filters.items()])
+        f = {k: str(v) for k, v in filters.items()}
+        order = f.pop("order", "")
+        direction = "desc" if order.endswith(".desc") else "asc"
+        try:
+            limit = int(f.pop("limit", 5000))
+        except ValueError:
+            limit = 5000
+
+        def val(key, ops=("eq",)):
+            raw = f.get(key)
+            if raw is None:
+                return None
+            for op in ops:
+                if raw.startswith(op + "."):
+                    return raw[len(op) + 1:]
+            return raw
+
+        def rng(key):
+            # kwargs carry one value per column, so a get() range was always
+            # single-sided: gte. means start, lt./lte. means end.
+            raw = f.get(key)
+            if raw is None:
+                return None, None
+            if raw.startswith("gte."):
+                return raw[4:], None
+            if raw.startswith(("lt.", "lte.")):
+                return None, raw.split(".", 1)[1]
+            return None, None
+
+        if table in self._LEGACY_HTF:
+            sym = val("symbol")
+            if not sym:
+                raise LSEError(400, "symbol=eq.<SYMBOL> is required")
+            start, end = rng("timestamp")
+            return self.candles(sym, self._LEGACY_HTF[table], start=start, end=end,
+                                limit=limit, order=direction)
+        if table.startswith(("candles_", "d_candles_")):
+            sym = self._symbol_from_slug(table.split("candles_", 1)[1])
+            start, end = rng("timestamp")
+            return self.candles(sym, "1m", start=start, end=end, limit=limit, order=direction)
+        if table == "economic_calender":
+            start, end = rng("datetime")
+            region = val("region_code", ("eq", "in"))
+            if region:
+                region = region.strip("()")
+            event = val("event", ("ilike",))
+            return self.economic_calendar(region=region,
+                                          event=event.strip("*") if event else None,
+                                          start=start, end=end,
+                                          released_only=f.get("actual") == "not.is.null",
+                                          order=direction, limit=limit)
+        if table == "z_insider_trades":
+            start, end = rng("transaction_date")
+            return self.insider_trades(val("symbol"), type=val("transaction_type"),
+                                       start=start, end=end, order=direction, limit=limit)
+        if table == "dividends":
+            start, end = rng("effective_date")
+            return self.dividends(val("symbol"), start=start, end=end,
+                                  order=direction, limit=limit)
+        if table == "stock_splits":
+            start, end = rng("effective_date")
+            return self.splits(val("symbol"), start=start, end=end,
+                               order=direction, limit=limit)
+        if table == "x_options_chain":
+            und = val("underlying")
+            if not und:
+                raise LSEError(400, "underlying=eq.<SYMBOL> is required")
+            dmin, dmax = None, None
+            raw_dte = f.get("dte")
+            if raw_dte:
+                if raw_dte.startswith("gte."):
+                    dmin = int(raw_dte[4:])
+                elif raw_dte.startswith("lte."):
+                    dmax = int(raw_dte[4:])
+            return self.options(und, type=val("contract_type"), expiry=val("expiry"),
+                                strike=val("strike"), min_dte=dmin, max_dte=dmax, limit=limit)
+        if table == "x_options_flow":
+            start, end = rng("ts")
+            prem = f.get("premium")
+            return self.options_flow(val("underlying"), type=val("contract_type"),
+                                     min_premium=float(prem[4:]) if prem and prem.startswith("gte.") else None,
+                                     expiry=val("expiry"), start=start, end=end,
+                                     order=direction, limit=limit)
+        if table == "x_options_flow_1m":
+            tick = val("ticker")
+            if not tick:
+                raise LSEError(400, "ticker=eq.<OSI> is required")
+            start, end = rng("minute")
+            return self.option_candles(tick, start=start, end=end,
+                                       order=direction, limit=limit)
+        raise LSEError(400, f"'{table}' is not served any more; the REST API reads "
+                            "the vault now. Use candles(), economic_calendar(), "
+                            "insider_trades(), dividends(), splits(), cot(), "
+                            "financial_reports(), company_profiles(), fundamentals(), "
+                            "bond_yields(), options(), options_flow(), option_candles(), "
+                            "or history()/dataset() for bulk Parquet pulls.")
+
+    # Vault dataset -> the category label this API has always used, plus labels
+    # for the classes the vault added. Kept as a mapping so catalog(category=...)
+    # accepts both vocabularies.
+    _CATEGORY_LABELS = {
+        "stocks": "Stocks", "fx": "Forex", "crypto": "Crypto", "etf": "ETFs",
+        "index": "Indices", "commodity": "Commodities", "options": "Options",
+        "eurex": "Futures", "economics": "Economics", "bonds": "Bonds",
+        "volatility": "Volatility", "interest_rates": "Interest rates",
+        "currency_index": "Currency index",
+    }
 
     def catalog(self, category: Optional[str] = None) -> List[dict]:
-        """List every available instrument, each a dict of
-        {"symbol", "name", "category"}. No connection or key required; use it
-        to discover exact symbols before streaming or downloading.
+        """Every instrument in the vault, one dict per (dataset, symbol) with
+        {"symbol", "name", "category", "dataset", "ticks", "first", "last",
+        "country"}. Requires the API key (it reads the live vault catalog);
+        use it to discover exact symbols and their history span before
+        streaming or downloading.
 
-        category (optional): one of stock, forex, crypto, etf, commodity, index
-        (singular or plural). Omit for the full list.
+        category (optional): stock(s), forex/fx, crypto, etf(s), commodity(ies),
+        index/indices, options, futures/eurex, economics, bonds.
 
         Example:
-            client.catalog()                   # all ~4,100 instruments
+            client.catalog()                   # every instrument, 22,000+ rows
             crypto = client.catalog("crypto")  # [{"symbol": "BTC/USD", ...}, ...]
             symbols = [x["symbol"] for x in client.catalog("forex")]
         """
         if self._catalog_cache is None:
-            req = urllib.request.Request(_CATALOG_URL, headers={"User-Agent": _USER_AGENT})
-            with urllib.request.urlopen(req, timeout=self._rest_timeout) as resp:
-                self._catalog_cache = json.loads(resp.read().decode("utf-8"))
+            self._catalog_cache = [
+                {"symbol": r.get("symbol", ""), "name": r.get("name") or "",
+                 "category": self._CATEGORY_LABELS.get(r.get("dataset", ""),
+                                                       str(r.get("dataset", "")).title()),
+                 "dataset": r.get("dataset", ""), "ticks": r.get("ticks"),
+                 "first": r.get("first_tick"), "last": r.get("last_tick"),
+                 "country": r.get("country_name") or None}
+                for r in self.datasets()
+            ]
         items = self._catalog_cache
         if category:
             norm = {
@@ -935,6 +1042,13 @@ class LSE:
                 "etf": "ETFs", "etfs": "ETFs",
                 "commodity": "Commodities", "commodities": "Commodities",
                 "index": "Indices", "indices": "Indices",
+                "option": "Options", "options": "Options",
+                "future": "Futures", "futures": "Futures", "eurex": "Futures",
+                "economic": "Economics", "economics": "Economics",
+                "bond": "Bonds", "bonds": "Bonds",
+                "volatility": "Volatility",
+                "interest_rates": "Interest rates", "rates": "Interest rates",
+                "currency_index": "Currency index",
             }
             want = norm.get(category.lower(), category)
             items = [x for x in items if x.get("category") == want]
@@ -1088,7 +1202,7 @@ class LSE:
                         code = msg.get("code", "")
                         self._emit("error", msg.get("message", "Unknown error"))
                         # Fatal errors will never succeed on retry: a bad/inactive
-                        # key, or a key that is over its monthly data limit. Any
+                        # key, or a key the server refuses to serve. Any
                         # error that arrives before we authenticate is fatal too.
                         # Stop the (re)connect loop instead of hammering forever.
                         if code in ("INVALID_KEY", "MISSING_KEY", "QUOTA_EXCEEDED") or not self._authenticated:

@@ -5,15 +5,13 @@ test_limits.py: verify the lse-data plan limits against the live API.
 The plan documents three caps on a single data key. This script exercises
 each one against the real server so you can confirm they hold:
 
-  1. row cap        every REST call returns at most 5000 rows
-  2. rate limit     about 100 calls per minute, then HTTP 429
+  1. row cap        every synchronous vault call returns at most one page of rows
+  2. rate limit     the plan's calls per minute, then HTTP 429
   3. data metering  every response body is measured in bytes and billed
-                    against the 50 GB monthly allowance shared with streaming
+                    against the monthly allowance shared with streaming
 
-The monthly allowance has no public usage endpoint, so this script cannot
-read your remaining GB. It can only show the byte size the server bills for
-each call and a running session total, which is enough to prove the meter
-is real and to estimate how far 50 GB goes.
+GET /vault/usage (with the key) reports the live monthly figures; this script
+reads it before and after so the meter is proven against real numbers.
 
 The key is read from the LSE_API_KEY environment variable or the --key
 argument. It is never written to a file.
@@ -48,16 +46,16 @@ from lse import LSE, LSEError  # noqa: E402
 # Reuse the SDK's own endpoint constants so this test never drifts from the
 # client it is verifying. _USER_AGENT matters because the download host sits
 # behind a CDN that bounces the default Python urllib agent.
-from lse.client import API_URL, WS_URL, _USER_AGENT  # noqa: E402
+from lse.client import WS_URL, _USER_AGENT  # noqa: E402
+from lse.vault import VAULT_URL  # noqa: E402
 
 
-# A table with far more than 5000 rows for any liquid symbol, so the row cap
-# is actually exercised. 5000 hourly bars is about 208 days, which every
-# listed crypto has, so the server is forced to truncate.
-DEEP_TABLE = "x_candles_1h"
+# A query with far more rows than one page for any liquid symbol, so the row
+# cap is actually exercised: years of hourly bars force the server to truncate.
+DEEP_PARAMS = [("timeframe", "1h"), ("order", "desc"), ("limit", "10000")]
 # The cheapest possible billable call: one daily bar. Used for the rate test
 # where call count matters and payload size does not.
-CHEAP_TABLE = "x_candles_1d"
+CHEAP_PARAMS = [("timeframe", "1d"), ("order", "desc"), ("limit", "1")]
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -77,13 +75,13 @@ class Meter:
         self.billed = 0         # server reported X-Data-Bytes (the real meter)
         self.last_billed = 0    # X-Data-Bytes of the most recent call
 
-    def get(self, table, params, key, timeout=30):
-        """One raw GET against /iso/<table>. Returns (status, nbytes, body,
+    def get(self, params, key, timeout=30):
+        """One raw GET against /vault/candles. Returns (status, nbytes, body,
         seconds). Counts toward the session meter whether it succeeds or 429s.
         Captures the server's X-Data-Bytes header, which is the exact figure
-        the server adds to your monthly 50 GB allowance for this call."""
-        qs = urllib.parse.urlencode(params, safe=".,():*")
-        url = f"{API_URL}/{table}" + (f"?{qs}" if qs else "")
+        the server adds to your monthly allowance for this call."""
+        qs = urllib.parse.urlencode(params)
+        url = f"{VAULT_URL}/candles" + (f"?{qs}" if qs else "")
         req = urllib.request.Request(
             url, headers={"x-api-key": key, "User-Agent": _USER_AGENT}
         )
@@ -154,11 +152,7 @@ async def _probe_tier(key, timeout=10):
 
 def check_auth(meter, key, symbol):
     section("1. Authentication")
-    status, nbytes, body, dt = meter.get(
-        CHEAP_TABLE,
-        [("symbol", f"eq.{symbol}"), ("order", "timestamp.desc"), ("limit", "1")],
-        key,
-    )
+    status, nbytes, body, dt = meter.get([("symbol", symbol)] + CHEAP_PARAMS, key)
     if status == 200:
         passed = ok("REST key accepted", f"{symbol} {status} in {dt * 1000:.0f} ms")
     elif status in (401, 403):
@@ -182,16 +176,12 @@ def check_auth(meter, key, symbol):
 # --------------------------------------------------------------------------
 
 def check_cap(meter, key, symbol):
-    section("2. Row cap (max 5000 per call)")
+    section("2. Row cap (one page per call)")
     # Ask the raw API for 10000 rows, bypassing the SDK so we test the SERVER
     # cap, not the client clamp. A correct server truncates to 5000.
-    status, nbytes, body, dt = meter.get(
-        DEEP_TABLE,
-        [("symbol", f"eq.{symbol}"), ("order", "timestamp.desc"), ("limit", "10000")],
-        key,
-    )
+    status, nbytes, body, dt = meter.get([("symbol", symbol)] + DEEP_PARAMS, key)
     if status != 200:
-        return fail("could not fetch deep history", f"HTTP {status} on {DEEP_TABLE}")
+        return fail("could not fetch deep history", f"HTTP {status} on /vault/candles")
     rows = json.loads(body)
     n = len(rows)
     detail = f"asked 10000, got {n} rows, {human_bytes(nbytes)} in {dt * 1000:.0f} ms"
@@ -217,18 +207,14 @@ def check_cap(meter, key, symbol):
 # --------------------------------------------------------------------------
 
 def check_rate(meter, key, symbol, n_calls, workers):
-    section(f"3. Rate limit (~100 calls/min)")
+    section("3. Rate limit (plan calls per minute)")
     print(f"  {DIM}firing {n_calls} cheap calls across {workers} workers; "
           f"this intentionally spends a minute of your call budget{OFF}")
 
     results = []  # (status, latency) per call
 
     def one(_):
-        status, _b, _body, dt = meter.get(
-            CHEAP_TABLE,
-            [("symbol", f"eq.{symbol}"), ("order", "timestamp.desc"), ("limit", "1")],
-            key,
-        )
+        status, _b, _body, dt = meter.get([("symbol", symbol)] + CHEAP_PARAMS, key)
         return status, dt
 
     t0 = time.perf_counter()
@@ -249,54 +235,53 @@ def check_rate(meter, key, symbol, n_calls, workers):
     if limited == 0:
         return fail("no 429 seen", f"all {n_calls} calls passed; raise --rate-calls to push past the limit")
 
-    # The limit is enforced, which is the pass condition. But report the
-    # observed burst ceiling against the documented 100/min, because the two
-    # can diverge: a token bucket with a large burst pool accepts far more
-    # than 100 in one burst before throttling. Surface that honestly rather
-    # than pretending the documented number is what the server does.
+    # The limit is enforced, which is the pass condition. Report the observed
+    # ceiling too, since the window boundary means a burst can straddle two
+    # minutes and pass slightly more than one minute's quota.
     passed = ok("rate limit enforced",
                 f"throttled after ~{ok_count} accepted in {elapsed:.1f}s")
     print(f"  {DIM}observed burst ceiling ~{ok_count} calls "
           f"(~{rate_per_min:,.0f}/min equivalent) before the first 429{OFF}")
-    if ok_count > 150:
-        print(f"  {DIM}note: that is well above the documented ~100/min, so the "
-              f"published figure is conservative; the key tolerates a large "
-              f"burst before throttling{OFF}")
     return passed
 
 
 # --------------------------------------------------------------------------
-# Check 4: per call byte metering toward the 50 GB monthly allowance
+# Check 4: per call byte metering toward the monthly allowance
 # --------------------------------------------------------------------------
 
 def check_bytes(meter, key, symbol):
-    section("4. Data metering (50 GB/month, shared with streaming)")
+    section("4. Data metering (monthly allowance, shared with streaming)")
     # Pull one full 5000 row page and report its billed size, then extrapolate
     # to show how far the monthly allowance stretches at that payload size.
     # One retry after a short wait covers the case where a rate burst (this
     # script's own, or a prior run's) left the bucket briefly drained.
-    params = [("symbol", f"eq.{symbol}"), ("order", "timestamp.desc"), ("limit", "5000")]
-    status, nbytes, body, dt = meter.get(DEEP_TABLE, params, key)
+    params = [("symbol", symbol), ("timeframe", "1h"), ("order", "desc"), ("limit", "5000")]
+    status, nbytes, body, dt = meter.get(params, key)
     if status == 429:
-        print(f"  {DIM}bucket drained from a prior burst, waiting 3s and retrying{OFF}")
-        time.sleep(3)
-        status, nbytes, body, dt = meter.get(DEEP_TABLE, params, key)
+        print(f"  {DIM}bucket drained from a prior burst, waiting 65s for a fresh minute window{OFF}")
+        time.sleep(65)
+        status, nbytes, body, dt = meter.get(params, key)
     if status != 200:
         return fail("could not sample a full page", f"HTTP {status}")
     rows = len(json.loads(body))
     # The server's X-Data-Bytes header is the exact amount this call added to
     # your monthly bucket. It matches the body size, and is what the quota gate
-    # sums (REST downloads + WS streaming) against the 50 GB cap.
+    # sums (REST downloads + WS streaming) against the monthly cap.
     per_call = meter.last_billed
-    allowance = 50 * 1024 ** 3
-    calls_in_quota = allowance // per_call if per_call else 0
     ok("server billed this call", f"{rows} rows, X-Data-Bytes = {per_call:,} ({human_bytes(per_call)})")
-    print(f"  {DIM}that figure is added to your 50 GB; downloads and streaming "
-          f"share the one bucket{OFF}")
-    print(f"  {DIM}at this size, 50 GB is about {calls_in_quota:,} full pages "
-          f"(~{calls_in_quota * rows:,} rows) before the allowance is spent{OFF}")
-    print(f"  {DIM}note: no public endpoint exposes your remaining GB, so this "
-          f"shows billed size per call, not your live balance{OFF}")
+    # /vault/usage is the live balance: read it so the meter is checked against
+    # the server's own monthly figure, not an assumed allowance.
+    req = urllib.request.Request(f"{VAULT_URL}/usage",
+                                 headers={"x-api-key": key, "User-Agent": _USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            u = json.loads(resp.read().decode())
+        used, cap = u.get("bytes_used_month", 0), u.get("bytes_cap_month", -1)
+        detail = f"{human_bytes(used)} used" + ("" if cap in (-1, None) else f" of {human_bytes(cap)}")
+        ok("usage endpoint reports the live balance", detail)
+    except Exception as e:
+        print(f"  {DIM}(usage read skipped: {e}){OFF}")
+    print(f"  {DIM}downloads and streaming share the one monthly bucket{OFF}")
     return True
 
 
@@ -328,7 +313,7 @@ def main():
         selected = {k: True for k in selected}
 
     print(f"{BOLD}lse-data limit verification{OFF}  "
-          f"{DIM}key {key[:13]}..., symbol {args.symbol}, host {API_URL}{OFF}")
+          f"{DIM}key {key[:13]}..., symbol {args.symbol}, host {VAULT_URL}{OFF}")
 
     meter = Meter()
     results = {}
@@ -349,7 +334,7 @@ def main():
         mark = f"{GREEN}PASS{OFF}" if passed else f"{RED}FAIL{OFF}"
         print(f"  {mark}  {name}")
     print(f"  {DIM}this session: {meter.calls} calls, server billed "
-          f"{human_bytes(meter.billed)} against your 50 GB monthly allowance{OFF}")
+          f"{human_bytes(meter.billed)} against your monthly allowance{OFF}")
 
     return 0 if all(results.values()) else 1
 

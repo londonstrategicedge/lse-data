@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.14.0
+
+Changed
+
+- Every REST read is now served from the LSE vault
+  (`api.londonstrategicedge.com/vault/...`) instead of the legacy `/iso`
+  endpoints. Method signatures and row shapes are unchanged; what changed is
+  what is behind them:
+  - `candles()` accepts every vault resolution ("1s", "5s", "15s", "30s",
+    "1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1mo") and reaches
+    the vault's full depth (US stocks back to 2003, FX to 2009, crypto to
+    2017). Stock and ETF candles come back split adjusted.
+  - `catalog()` reads the live vault catalog (one row per dataset and symbol,
+    22,000+ instruments including economics series, bond yield tenors and
+    option underlyings) instead of a static file, so it now needs the API key.
+    Rows keep `symbol`/`name`/`category` and gain `dataset`, `ticks`, `first`,
+    `last` and `country`.
+  - `options_underlyings()` also reads the catalog and needs the key.
+  - `option_candles()` merges archive bars and live folded prints on the
+    server in one call.
+  - `get()` still accepts the previously documented `/iso` table names and
+    PostgREST-style filters, translating them onto the vault; anything else
+    raises an error naming the method to use instead.
+  - `economic_calendar()` no longer sends a staleness filter; the vault copy
+    holds only current events.
+
+Added
+
+- `series()`: any (date, value) observation stream in one synchronous call,
+  with the class resolved from the catalog: `series("cpi_yoy")` for a macro
+  series, `series("US10Y")` for a bond yield tenor. `economics(symbol)` now
+  returns those rows instantly instead of running an export job (use
+  `history(symbol, dataset="economics")` when you want Parquet).
+- New reference readers, same row-dict shape as the rest: `cot()`,
+  `financial_reports()` (statements parsed from JSON), `company_profiles()`,
+  `fundamentals()` and `bond_yields()`.
+- `candles(..., dataset=...)` to pin the asset class when a symbol exists in
+  more than one.
+- Options history keeps accumulating in the vault: prints older than the old
+  one week window stay queryable through `options_flow()` with `start`/`end`.
+- `LSE(..., timeout=)` sets the REST timeout per client. The default rose from
+  30s to 60s because the deepest vault queries (1s candles over long spans)
+  can take tens of seconds.
+
+Fixed
+
+- Timeouts and connection failures on REST calls and downloads now raise
+  `LSEError` like HTTP errors always did, instead of leaking a raw
+  `TimeoutError`/`URLError` traceback. One `except LSEError` covers every
+  failed call.
+- Bare `lse` (and `lse browse`) without an interactive terminal exits with a
+  plain one-line message pointing at `lse datasets`, instead of a curses
+  traceback. Ctrl+C inside the browser exits quietly.
+
+## 0.13.0
+
+Added
+
+- The vault: `history()` pulls deep history (raw ticks or any of 14 candle
+  resolutions) as Parquet through resumable async export jobs; `dataset()`
+  downloads whole reference datasets; `economics()` lists and pulls macro
+  series; `datasets()` and `reference()` list what the vault holds;
+  `vault_meta()` describes its shape. DataFrames come back directly with
+  `pip install 'lse-data[frames]'`.
+- `lse browse`: a curses TUI over the vault catalog (also the bare `lse`
+  default), plus `lse datasets` for a plain listing.
+
+Changed
+
+- Docstrings no longer state fixed limits or allowances; `vault_usage` was
+  dropped in favour of the server-side usage endpoint.
+
 ## 0.12.0
 
 Added
