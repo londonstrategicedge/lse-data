@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lsedata"
+version = "0.1.0"
+description = "Alias package for lse-data, the London Strategic Edge Python client. Installing it installs lse-data."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    { name = "London Strategic Edge", email = "support@londonstrategicedge.com" },
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "lse-data",
+]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["lsedata.py"]
+
+[project.urls]
+Homepage = "https://londonstrategicedge.com"
+Repository = "https://github.com/londonstrategicedge/lse-data"
