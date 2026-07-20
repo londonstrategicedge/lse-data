@@ -199,4 +199,11 @@ lse stream BTC/USD AAPL
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+This client is MIT licensed. See [LICENSE](LICENSE).
+
+That licence extends to the library alone and confers no rights in the data
+obtained through it. Data retrieved with an LSE key may be used for your own
+research, trading and model training, including for commercial purposes. It may
+not be redistributed, resold, or otherwise made available to third parties,
+whether in bulk or by way of any competing feed, download service or interface
+sourced from LSE. Full terms: https://londonstrategicedge.com/terms
