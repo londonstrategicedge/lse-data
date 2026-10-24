@@ -1,17 +1,17 @@
 """
 Dynamic subscribe/unsubscribe - change subscriptions at runtime.
 
-Start with 3 symbols, then drop one after 50 ticks. Useful for
+Start with three symbols, then swap one for another after 50 ticks. Useful for
 dashboards where the user switches between instruments.
 
 Usage:
     pip install lse-data
-    python unsubscribe_example.py
+    LSE_API_KEY=lse_live_... python unsubscribe_example.py
 """
 
 from lse import LSE
 
-client = LSE(api_key="YOUR_API_KEY")
+client = LSE()  # reads LSE_API_KEY from the environment
 tick_count = 0
 removed_btc = False
 

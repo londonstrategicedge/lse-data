@@ -1,23 +1,21 @@
 """
-Save live ticks to a CSV file.
+Save live ticks to a CSV file, each with the time the server stamped on it.
 
 Usage:
     pip install lse-data
-    python save_to_csv.py
+    LSE_API_KEY=lse_live_... python save_to_csv.py
 """
 
 import csv
-import datetime
 from lse import LSE
 
-client = LSE(api_key="YOUR_API_KEY")
+client = LSE()  # reads LSE_API_KEY from the environment
 
 with open("ticks.csv", "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["timestamp", "symbol", "price", "bid", "ask"])
 
     for tick in client.stream(["BTC/USD", "ETH/USD"]):
-        now = datetime.datetime.now().isoformat()
-        writer.writerow([now, tick.symbol, tick.price, tick.bid, tick.ask])
+        writer.writerow([tick.timestamp, tick.symbol, tick.price, tick.bid, tick.ask])
         f.flush()  # write immediately so you can tail the file
-        print(f"{now} {tick.symbol} {tick.price}")
+        print(f"{tick.timestamp} {tick.symbol} {tick.price}")

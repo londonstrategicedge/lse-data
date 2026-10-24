@@ -6,12 +6,12 @@ WebSocket. Works from callbacks (on_tick) or from another thread.
 
 Usage:
     pip install lse-data
-    python disconnect_example.py
+    LSE_API_KEY=lse_live_... python disconnect_example.py
 """
 
 from lse import LSE
 
-client = LSE(api_key="YOUR_API_KEY")
+client = LSE()  # reads LSE_API_KEY from the environment
 tick_count = 0
 
 

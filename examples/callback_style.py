@@ -3,7 +3,7 @@ Callback-style example - event-driven tick handling.
 
 Usage:
     pip install lse-data
-    python callback_style.py
+    LSE_API_KEY=lse_live_... python callback_style.py
 """
 
 from lse import LSE
@@ -25,7 +25,7 @@ def on_error(msg):
     print(f"[ERROR] {msg}")
 
 
-client = LSE(api_key="YOUR_API_KEY")
+client = LSE()  # reads LSE_API_KEY from the environment
 client.on("tick", on_tick)
 client.on("connected", on_connected)
 client.on("authenticated", on_authenticated)

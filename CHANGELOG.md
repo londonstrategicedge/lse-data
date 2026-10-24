@@ -1,5 +1,46 @@
 # Changelog
 
+## LSE Data 3.0
+
+Every read of history now comes from `https://download.londonstrategicedge.com/v3`: eleven markets, over 76,000 instruments and 67 million US options contracts, resumable CSV and Parquet exports checked by SHA-256, macro and reference data, options chains and flow. The websocket, the key and the package are the same. [docs/api.md](https://github.com/londonstrategicedge/lse-data/blob/main/docs/api.md) describes every call.
+
+Kept, with the same names and row shapes
+
+- Streaming: `stream()`, `connect()`, `subscribe()`, `unsubscribe()`, `subscribe_options()`, `unsubscribe_options()`, `on()`, `disconnect()`, `stream_async()`, the `Tick` and `OptionTick` objects.
+- `candles()`, `series()`, `economics()`, `bond_yields()`, `economic_calendar()`, `insider_trades()`, `dividends()`, `splits()`, `cot()`, `financial_reports()`, `company_profiles()`, `fundamentals()`, `catalog()`, `datasets()`, `reference()`, `history()`, `dataset()`, `options()`, `options_flow()`, `option_candles()`, `options_underlyings()`, answered by LSE Data 3.0 underneath.
+- The command line: `lse auth`, `lse stream`, `lse browse`, `lse datasets`.
+
+Added
+
+- `markets()`, `health()`, `usage()`, `tables()`, `overview()`, `catalogue()`, `pair_page()`, `iter_pairs()`, `pairs()`, `factors()`: the catalogue of every market, with what the key may open and each instrument's stored rows.
+- `preview()`, `estimate()`, `rows()`, `export()`, `job()`: the last ten rows of any selection, what an export would weigh, a selection as rows, and the file itself: CSV or Parquet, streamed at once or prepared as a job, resumed with `Range` after a cut, placed only after its size and SHA-256 match. `data=` selects candles, the trade slice (`timeframe="tick"`), trades, quotes, the Level 2 book, Level 3 orders or the Greeks.
+- `dataset_export()`: candles with indicators, a companion instrument and local-time filters, computed on the server.
+- `options_chain()`, `options_flow_page()`: the chain and the flow as pages with their totals and window.
+- `macro_catalogue()`, `iter_macro_series()`, `macro_preview()`, `macro_series()`, `macro_estimate()`, `macro_export()`, `macro_chart_export()`: economic observations, releases and bond yields by country, as rows or files.
+- `reference_catalogue()`, `iter_reference_series()`, `reference_preview()`, `reference_estimate()`, `reference_export()`, `reference_rows()`: eighteen reference collections with every native column.
+- `load(path)`: a saved CSV or Parquet as a pandas DataFrame (the `frames` extra).
+- `LSEError.code` and `LSEError.required_plan`: the server's refusal code (`plan-required`, `history-limit`, `level-required`, ...) and the plan that opens a paid feed.
+- `LSE(..., data_url=, retries=, poll_seconds=, wait_for_limit=)`: the data server, how often a failed call is retried, how often a prepared export is polled, and whether a call past the plan's calls a minute waits once and tries again.
+
+Changed
+
+- Symbols are spelt as the catalogue lists them: `EUR_USD` for forex (the name `EUR/USD` is accepted too), `BTCUSDT` for crypto (`BTC/USD` is accepted too), `ESZ6` for a CME contract. A symbol listed in several markets resolves to US stocks unless `market=` says otherwise.
+- `candles()` holds its rows in memory and reads a window of dates: pass `start` and `end`, or `limit` for the most recent bars. As in 0.x it returns at most `limit` bars, the first ones from `start` (the newest with `order="desc"`), and reads a long window a span of days at a time until it has them. `start` may be a timestamp when `end` is a date. The row's time key is still `timestamp`; rows also carry `trades`. For years of candles use `history()` or `export()`.
+- `series()` takes the catalogue's codes: yields keep their names (`US10Y`); observations use the country-prefixed codes (`US.core_inflation_rate`). The 0.x names `cpi_yoy` and `fdtr` answer as `US.inflation_rate` and `US.interest_rate`. A name that is not a code is searched; a search that matches different series raises `series-ambiguous` with the codes, and `macro_catalogue()` lists them all.
+- The reference readers read a collection and filter it: `insider_trades(type=)`, `financial_reports(report_type=, period=)`, `economic_calendar(region=, event=, released_only=)` apply their filters on the rows.
+- `catalog()` lists every instrument of the nine listed markets, Nasdaq TotalView included; the two contract markets, US options and CME Globex, are listed by underlying, and `pairs(market, underlying=...)` pages through their contracts. Rows gain `pair_id`; `ticks` is the instrument's stored rows.
+- `history()` takes `market=` beside the old `dataset=`, defaults to one-minute candles, needs `start` and `end` for a bounded pull (without them the whole stored history is asked for), and returns the file's path with `dataframe=False`.
+- `options_flow()` carries each print's `venue`; `option_candles()` takes `timeframe=`.
+- An option contract is accepted with or without the spaces of its OCC symbol: `AAPL  261120C00100000` or `AAPL261120C00100000`.
+- `LSEError(status, message)` keeps its two positional arguments; `str(e)` is unchanged.
+- The package needs no extra dependency for files; `frames` stays optional.
+
+Removed
+
+- `get()` over the retired `/iso` tables raises `LSEError` (410, `removed`) naming the methods to use.
+- `vault_meta()`: `markets()`, `catalogue()` and `reference_catalogue()` answer what it answered.
+- Arrow exports: files are CSV or Parquet.
+
 ## 0.14.0
 
 Changed
@@ -21,9 +62,9 @@ Changed
   - `option_candles()` merges archive bars and live folded prints on the
     server in one call.
   - `get()` still accepts the previously documented `/iso` table names and
-    PostgREST-style filters, translating them onto the vault; anything else
+    their filters, translating them onto the vault; anything else
     raises an error naming the method to use instead.
-  - `economic_calendar()` no longer sends a staleness filter; the vault copy
+  - `economic_calendar()` no longer sends a staleness filter; the vault
     holds only current events.
 
 Added
@@ -39,10 +80,10 @@ Added
 - `candles(..., dataset=...)` to pin the asset class when a symbol exists in
   more than one.
 - Options history keeps accumulating in the vault: prints older than the old
-  one week window stay queryable through `options_flow()` with `start`/`end`.
+  one-week window stay queryable through `options_flow()` with `start`/`end`.
 - `LSE(..., timeout=)` sets the REST timeout per client. The default rose from
-  30s to 60s because the deepest vault queries (1s candles over long spans)
-  can take tens of seconds.
+  30s to 60s because the longest queries (1s candles over long spans) can
+  take tens of seconds.
 
 Fixed
 
@@ -69,8 +110,7 @@ Added
 
 Changed
 
-- Docstrings no longer state fixed limits or allowances; `vault_usage` was
-  dropped in favour of the server-side usage endpoint.
+- `vault_usage` was dropped in favour of the server's usage endpoint.
 
 ## 0.12.0
 
@@ -82,7 +122,7 @@ Added
   from tickers or company names in any case.
 - `options_flow()`: recent option prints (time and sales) with premium, IV
   and greeks, across one underlying or the whole tape (`min_premium=250_000`).
-- `option_candles()`: 1 minute premium OHLC + greeks history for a single
+- `option_candles()`: 1-minute premium OHLC + greeks history for a single
   contract, addressed by OSI ticker or by parts
   (`option_candles("AAPL", strike=205, expiry="2026-06-12", type="call")`).
   Archive bars and a live trailing week merge into one continuous series.
@@ -97,11 +137,11 @@ Added
   contract parsed into named fields: `underlying`, `right` ("call"/"put"),
   `strike`, `expiry` (a `date`), plus `dte`, `premium` (alias of `price`) and
   `notional` (price x volume x 100) properties. `print(tick)` is now readable.
-  Non option symbols still produce plain `Tick` objects, and `OptionTick` is a
+  Non-option symbols still produce plain `Tick` objects, and `OptionTick` is a
   `Tick`, so existing callbacks keep working unchanged.
-- `tape()`: a ready made tick callback that prints an aligned column table
+- `tape()`: a ready-made tick callback that prints an aligned column table
   (time, underlying, type, strike, expiry, DTE, premium, volume, notional)
-  with a one time header. Usage: `client.on("tick", tape())`.
+  with a one-time header. Usage: `client.on("tick", tape())`.
 
 Fixed
 
@@ -139,4 +179,4 @@ Fixed
 
 - Streaming no longer hangs or reconnects forever on a bad or over-quota key,
   and `disconnect()` now ends a `stream()`/replay loop cleanly.
-- REST calls send a User-Agent so the CDN does not bounce them.
+- REST calls send a User-Agent header.

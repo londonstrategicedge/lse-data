@@ -4,8 +4,8 @@ Command-line interface for lse-data.
 Usage:
     lse auth lse_live_xxxxxxxxxxxx
     lse stream BTC/USD ETH/USD AAPL
-    lse browse          (or just `lse`: the databank browser in your terminal)
-    lse datasets        (plain table of everything in the vault)
+    lse browse          (or just `lse`: the catalogue browser in your terminal)
+    lse datasets        (plain table of every market and reference collection)
 """
 
 import argparse
@@ -37,8 +37,11 @@ def load_api_key() -> str:
 
 def save_api_key(key: str):
     CONFIG_DIR.mkdir(exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps({"api_key": key}, indent=2))
-    CONFIG_PATH.chmod(0o600)
+    # Created readable by its owner only, so the key is never on disk for others to read.
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps({"api_key": key}, indent=2))
+    CONFIG_PATH.chmod(0o600)  # a file made by an older version keeps its mode otherwise
 
 
 def require_key() -> str:
@@ -88,22 +91,15 @@ def cmd_browse(args):
 
 def cmd_datasets(args):
     # Plain, pipeable table (the browser's data without the browser). One row per
-    # class plus the reference files, so `lse datasets` answers "what is there and
-    # how much" in one screen.
+    # market and one per reference collection, so `lse datasets` answers "what is
+    # there and how much" in one screen.
     from .tui import fnum, REF_NAMES
     client = LSE(api_key=require_key())
-    rows = client.datasets()
-    agg = {}
-    for r in rows:
-        a = agg.setdefault(r["dataset"], [0, 0, "9999"])
-        a[0] += 1
-        a[1] += int(r["ticks"] or 0)  # a class with no ticks yet must not crash the table
-        f = str(r["first_tick"])[:10]
-        if f < a[2]:
-            a[2] = f
-    print(f"{'CLASS':<18}{'SYMBOLS':>9}{'TICKS':>10}   SINCE")
-    for name, (n, t, first) in sorted(agg.items(), key=lambda x: -x[1][1]):
-        print(f"{name:<18}{n:>9,}{fnum(t):>10}   {first[:4]}")
+    markets = client.catalogue().get("exchanges") or []
+    print(f"{'MARKET':<24}{'SYMBOLS':>12}{'ROWS':>10}   SINCE")
+    for m in sorted(markets, key=lambda x: -int(x.get("rows") or 0)):
+        first = str(m.get("first") or "")[:4]
+        print(f"{m.get('name') or m.get('exchange'):<24}{int(m.get('symbols') or 0):>12,}{fnum(m.get('rows')):>10}   {first}")
     try:
         refs = client.reference()
     except Exception:
@@ -128,15 +124,14 @@ def main(argv=None):
     ps.add_argument("symbols", nargs="+", help="One or more symbols to subscribe to")
     ps.set_defaults(func=cmd_stream)
 
-    pb = sub.add_parser("browse", help="Browse and download the databank in your terminal")
+    pb = sub.add_parser("browse", help="Browse the catalogue and download in your terminal")
     pb.set_defaults(func=cmd_browse)
 
-    pd = sub.add_parser("datasets", help="Print everything in the vault as a plain table")
+    pd = sub.add_parser("datasets", help="Print every market and reference collection as a plain table")
     pd.set_defaults(func=cmd_datasets)
 
     args = p.parse_args(argv)
-    # Bare `lse` opens the browser: the two seconds from install to seeing the whole
-    # databank is the product.
+    # Bare `lse` opens the catalogue browser.
     if not args.cmd:
         return cmd_browse(args)
     args.func(args)

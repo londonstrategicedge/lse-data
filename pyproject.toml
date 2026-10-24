@@ -1,20 +1,20 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.21,<1.28"]
 build-backend = "hatchling.build"
 
 [project]
 name = "lse-data"
-version = "0.14.0"
-description = "Python client for London Strategic Edge market data: live streaming, deep vault history as Parquet, economics series, options chains and flow"
+version = "3.0"
+description = "Python client for London Strategic Edge market data: live streaming, LSE Data 3.0 history as CSV and Parquet with resumable checked downloads, macro and reference data, options chains and flow"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"
 authors = [
     { name = "London Strategic Edge", email = "support@londonstrategicedge.com" },
 ]
-keywords = ["trading", "market data", "websocket", "stocks", "crypto", "forex", "options", "realtime"]
+keywords = ["trading", "market data", "websocket", "stocks", "crypto", "forex", "options", "futures", "realtime", "parquet", "csv", "level 2", "level 3"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Financial and Insurance Industry",
     "License :: OSI Approved :: MIT License",
@@ -33,8 +33,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# DataFrame return path for vault pulls: history()/dataset() hand back pandas
-# DataFrames when these are present; without them the Parquet file path returns.
+# DataFrames: history(), dataset() and load() return pandas DataFrames with
+# this extra; without it, pass dataframe=False to get the file's path.
 frames = ["pyarrow>=14", "pandas>=1.5"]
 
 [project.scripts]
@@ -43,9 +43,11 @@ lse = "lse.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["lse"]
 
+[tool.hatch.build.targets.sdist]
+include = ["lse", "docs", "examples", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+
 [project.urls]
 Homepage = "https://londonstrategicedge.com"
-Documentation = "https://github.com/londonstrategicedge/lse-data"
+Documentation = "https://github.com/londonstrategicedge/lse-data/blob/main/docs/api.md"
 Repository = "https://github.com/londonstrategicedge/lse-data"
 Issues = "https://github.com/londonstrategicedge/lse-data/issues"
-Terms = "https://londonstrategicedge.com/terms"
