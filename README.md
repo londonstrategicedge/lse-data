@@ -53,7 +53,7 @@ latest   = client.candles("BTCUSDT", "1d", limit=30, order="desc")
 
 # The last ten rows of anything, and what an export would weigh, before you ask for it
 peek     = client.preview("us_stocks", "AAPL", "5m")
-size     = client.estimate("us_stocks", "AAPL", "1m", "2016-01-04", "2026-10-21", format="parquet")
+size     = client.estimate("us_stocks", "AAPL", "1m", "2021-10-21", "2026-10-21", format="parquet")
 
 # Macro series and yields: (date, value) rows, any series in one call
 cpi      = client.series("US.core_inflation_rate", start="2020-01-01")
@@ -85,18 +85,22 @@ Rows are held in memory, so keep them to days or weeks. Years of candles, ticks 
 
 ## Files: CSV and Parquet
 
-`export()` saves a selection as a file and returns its path. Large exports are prepared on the server; downloads resume if the connection drops and are verified when they finish. The free plan includes 50 GB a month.
+`export()` saves a selection as a file and returns its path. Every export is sent whole with its size and SHA-256 and verified when it finishes; a download that drops is requested again from the start. The free plan includes 50 GB a month.
 
 ```python
-path = client.export("us_stocks", "AAPL", "1m", "2016-01-04", "2026-10-21", format="parquet")
+path = client.export("us_stocks", "AAPL", "1m", "2021-10-21", "2026-10-21", format="parquet")                # five years of one-minute candles
 path = client.export("us_stocks", "AAPL", "tick", "2026-10-21", "2026-10-21", format="csv")        # the trade slice
-path = client.export("nasdaq", "NVDA", "tick", "2026-10-14", "2026-10-14", data="book")             # the Level 2 book
-path = client.export("cme", "ESZ6", "tick", "2026-10-13", "2026-10-13", data="orders")              # Level 3 orders
+path = client.export("nasdaq", "NVDA", "tick", "2026-10-14 14:30:00", "2026-10-14 14:31:00", data="book")   # the Level 2 book, a minute of it
+path = client.export("cme", "ESZ6", "tick", "2026-10-13 14:30:00", "2026-10-13 14:31:00", data="orders")    # Level 3 orders, a minute of them
 path = client.macro_export("observation", "US.core_inflation_rate", "1957-02-01", "2026-07-01", format="csv")
 path = client.reference_export("company_profiles", "AAPL", format="csv")
 
 df = client.history("AAPL", timeframe="1d", start="2020-01-01", end="2026-10-01")   # a DataFrame with the frames extra
 ```
+
+One export reads at most 2,500,000 rows, on every plan; a wider one is refused with `413 export-too-wide`, which says how many rows it would have read. Five years of AAPL's one-minute candles are about 1.25 million rows. The book and the orders of a busy instrument run to millions of rows a day, so ask for them by time: two UTC timestamps, an hour or less at a time. `estimate()` with the same arguments says how many rows a selection holds before you download it.
+
+The free plan also reads at most 12,500,000 rows a day (`429 rows-exhausted` until 00:00 UTC) and 12.5 GiB a week (`429 allowance-exhausted` until Monday 00:00 UTC), at 50 Mbit/s. A paid plan has neither limit and downloads at 250 Mbit/s. Every plan has one download open at a time; one more answers `429 connections-exhausted` and names the file to wait for. `client.usage()` shows your figures and what is used.
 
 `pip install 'lse-data[frames]'` adds DataFrames to `history()`, `dataset()` and `load(path)`.
 
@@ -108,13 +112,13 @@ The whole US options tape, every contract, with implied volatility and the Greek
 
 ```python
 chain  = client.options("apple", type="call", max_dte=30)
-prints = client.options_flow("NVDA", min_premium=100_000)
-sweep  = client.options_flow(min_premium=250_000, limit=200)
+prints = client.options_flow("NVDA", min_premium=100_000, start="2026-11-09", end="2026-11-09")
+sweep  = client.options_flow(min_premium=250_000, start="2026-11-09", end="2026-11-09", limit=200)
 bars   = client.option_candles("AAPL", strike=100, expiry="2026-11-20", type="call")
 names  = client.options_underlyings()
 ```
 
-`options()` returns the chain, one row per contract with the last trade, volume, premium, implied volatility and Greeks. `options_flow()` returns prints with their premium and venue; leave out the underlying to scan every name. Its window is today by default, up to seven days with `start` and `end`. `option_candles()` returns candles for one contract. `subscribe_options(["AAPL"])` streams every AAPL contract live as `OptionTick` objects, which add `underlying`, `right`, `strike`, `expiry`, `dte`, `premium` and `notional` to a tick. With `from lse import tape`, `client.on("tick", tape())` prints them as a readable table.
+`options()` returns the chain, one row per contract with the last trade, volume, premium, implied volatility and Greeks. `options_flow()` returns prints with their premium and venue; leave out the underlying to scan every name. `start` and `end` set the window, up to seven days without an underlying; without them it is today (UTC), and a session's prints are stored after it ends, so name the days you want. `option_candles()` returns candles for one contract. `subscribe_options(["AAPL"])` streams every AAPL contract live as `OptionTick` objects, which add `underlying`, `right`, `strike`, `expiry`, `dte`, `premium` and `notional` to a tick. With `from lse import tape`, `client.on("tick", tape())` prints them as a readable table.
 
 ## Find instruments
 
@@ -148,7 +152,9 @@ client.on("tick", lambda t: print(t.symbol, t.price))
 client.connect(["BTC/USD"])
 ```
 
-Events are `tick`, `connected`, `authenticated`, `disconnected`, `error`, `replay_started` and `replay_complete`.
+Events are `tick`, `connected`, `authenticated`, `disconnected` and `error`.
+
+Crypto streams from `wss://london-ws.londonstrategicedge.com`; the default socket carries the other symbols of these examples. The client opens the crypto socket beside the default one, with the same key, for the crypto symbols you ask for, so one loop or callback carries both; a plan's connections are counted on each socket. If the crypto socket refuses the key, the `error` event says so with that address and the other symbols keep streaming. `LSE(api_key, url=...)` uses the one socket you name and nothing else; the [WebSocket documentation](https://londonstrategicedge.com/websocket-documentation) lists the sockets and what each carries.
 
 Change subscriptions while connected:
 
@@ -158,17 +164,7 @@ client.unsubscribe(["BTC/USD"])
 client.subscribe_options(["AAPL"])   # every AAPL contract at once
 ```
 
-### Replay then live
-
-Pass `start` to replay up to 24 hours of history before the live ticks, on the same connection.
-
-```python
-from datetime import datetime, timedelta, timezone
-
-start = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")   # UTC
-for tick in client.stream(["BTC/USD"], start=start):
-    print("replay" if tick.replay else "live", tick.symbol, tick.price)
-```
+The sockets carry live ticks only. Replay, `stream(..., start=...)`, was removed on 25 October 2026: the server refuses it and the client raises that refusal as `LSEError` (code `REPLAY_REMOVED`). For history use `candles()`, `rows()` or `export()`.
 
 ### Async
 
@@ -204,7 +200,7 @@ with LSE() as client:
         ...
 ```
 
-A tick has `symbol`, `price`, `bid`, `ask`, `volume`, `timestamp` (ISO 8601), `name` and `replay`; `tick.datetime` is the parsed timestamp.
+A tick has `symbol`, `price`, `bid`, `ask`, `volume`, `timestamp` (ISO 8601) and `name`; `tick.datetime` is the parsed timestamp.
 
 ## Settings
 
@@ -215,9 +211,9 @@ Every setting of `LSE()` is optional:
 | `timeout` | `60` | seconds to wait for each HTTP call |
 | `retries` | `3` | retries of a call that got no answer, or a 429, 500, 502, 503 or 504 |
 | `poll_seconds` | `0.5` | how often a prepared export is polled |
-| `wait_for_limit` | `True` | past your plan's calls a minute, wait the server's `Retry-After` once (at most two minutes) and try again; `False` raises at once |
+| `wait_for_limit` | `True` | on a `429`, wait the server's `Retry-After` once in a call, when it is two minutes or less, and ask again without using up a retry; `False` never waits |
 | `data_url` | `https://download.londonstrategicedge.com` | the LSE Data 3.0 server |
-| `url` | `wss://data-ws.londonstrategicedge.com` | the live WebSocket |
+| `url` | `wss://data-ws.londonstrategicedge.com` | the live WebSocket; left at its default, crypto symbols are streamed from `wss://london-ws.londonstrategicedge.com` beside it |
 
 ```python
 client = LSE(api_key="your_key", timeout=120, wait_for_limit=False)
@@ -240,6 +236,7 @@ Scripts written for 0.14 keep working: the method names and row shapes are the s
 - Symbols follow the catalogue. The 0.x spellings still resolve: `EUR/USD` to `EUR_USD`, `BTC/USD` to `BTCUSDT` (crypto is quoted in Tether).
 - `series()` takes catalogue codes (`US10Y`, `US.core_inflation_rate`). `cpi_yoy` and `fdtr` still work, as `US.inflation_rate` and `US.interest_rate`. A name matching several series raises `LSEError` with code `series-ambiguous` and lists them.
 - `get()` read the retired tables. It now raises `LSEError` (410, `removed`) naming the methods to use.
+- `stream(..., start=...)` replayed recent ticks before the live ones. Replay was removed on 25 October 2026; the call raises `LSEError` (410, `REPLAY_REMOVED`).
 
 [CHANGELOG.md](https://github.com/londonstrategicedge/lse-data/blob/main/CHANGELOG.md) lists every change and [docs/api.md](https://github.com/londonstrategicedge/lse-data/blob/main/docs/api.md) every call.
 

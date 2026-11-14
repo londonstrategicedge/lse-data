@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lse-data"
-version = "3.0"
-description = "Python client for London Strategic Edge market data: live streaming, LSE Data 3.0 history as CSV and Parquet with resumable checked downloads, macro and reference data, options chains and flow"
+version = "3.0.1"
+description = "Python client for London Strategic Edge market data: live streaming, LSE Data 3.0 history as CSV and Parquet with checksum-verified downloads, macro and reference data, options chains and flow"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"

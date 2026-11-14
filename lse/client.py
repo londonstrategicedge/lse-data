@@ -2,10 +2,12 @@
 LSE market data client: live streaming over WebSocket and history over HTTPS,
 both authorised by the same API key.
 
-Streaming connects to wss://data-ws.londonstrategicedge.com. Every read of
+Streaming connects to wss://data-ws.londonstrategicedge.com; crypto streams
+from wss://london-ws.londonstrategicedge.com, which a client on the default
+address opens beside it for the crypto symbols it is asked for. Every read of
 history goes to LSE Data 3.0 at https://download.londonstrategicedge.com/v3:
-the catalogue of eleven markets, previews, estimates, resumable CSV and
-Parquet exports with checksums, macro and reference data, options chains and
+the catalogue of eleven markets, previews, estimates, CSV and Parquet
+exports checked by SHA-256, macro and reference data, options chains and
 flow (see :mod:`lse.data3`). One key authorises everything.
 """
 
@@ -29,6 +31,12 @@ from .data3 import (DATA_KINDS, DEFAULT_BASE_URL, MARKETS, PAID_FEEDS, TIMEFRAME
 
 
 WS_URL = "wss://data-ws.londonstrategicedge.com"
+# Crypto streams from this socket since 8 November 2026; the default socket no
+# longer carries it. A client on the default address subscribes the symbols
+# the catalogue calls Crypto here, on a second connection with the same key,
+# and their ticks arrive in the same loop and callbacks. A client given its
+# own ``url`` uses that socket alone.
+CRYPTO_WS_URL = "wss://london-ws.londonstrategicedge.com"
 # The LSE Data 3.0 server. Every read of history goes here.
 DATA_URL = DEFAULT_BASE_URL
 # The retired REST base of releases before 3.0. Kept so older scripts that
@@ -37,6 +45,9 @@ API_URL = "https://api.londonstrategicedge.com/iso"
 
 # Seconds between the client's keep-alive pings on the WebSocket.
 PING_INTERVAL = 25
+# Ticks held between the sockets and the caller's loop. Small on purpose: a
+# caller slower than the feed keeps its ticks waiting at the server, as before.
+_TICK_QUEUE = 16
 
 
 @dataclass
@@ -51,7 +62,7 @@ class Tick:
     # Use the `datetime` property for a parsed, timezone-aware value.
     timestamp: Optional[str] = None
     name: Optional[str] = None
-    replay: bool = False  # True for historical ticks during replay
+    replay: bool = False  # always False: the sockets carry live ticks only (replay was removed in October 2026)
 
     @property
     def datetime(self):
@@ -177,14 +188,16 @@ class LSE(Data3Mixin):
     Args:
         api_key: Your LSE API key. Get one at https://londonstrategicedge.com/data
                  If omitted, the LSE_API_KEY environment variable is used.
-        url: WebSocket endpoint. Defaults to the production server.
+        url: WebSocket endpoint. Defaults to the production server, with
+                 crypto symbols served by the crypto socket beside it
+                 (CRYPTO_WS_URL). A url given here is used alone.
         timeout: Seconds to wait for each HTTP call (default 60).
         data_url: The LSE Data 3.0 server. Defaults to the production server.
         retries: Retries of a call the server answered 429 or 5xx (default 3).
         poll_seconds: How often a prepared export is polled (default 0.5).
         wait_for_limit: Past the plan's calls a minute the server answers 429
                  with Retry-After; by default the client waits that long once
-                 and tries again. False raises LSEError at once.
+                 in a call and asks again. False does not wait.
 
     Works as a context manager (``with LSE(...) as client:``), disconnecting
     on exit.
@@ -228,6 +241,15 @@ class LSE(Data3Mixin):
         self._api_key = api_key
         self._url = url
         self._ws: Optional[websockets.client.WebSocketClientProtocol] = None
+        # Crypto goes to its own socket only for a client on the default address.
+        self._route_crypto = url.rstrip("/") == WS_URL
+        self._crypto_url = CRYPTO_WS_URL
+        self._crypto_ws = None                          # the crypto socket, once it has authenticated
+        self._crypto_task: Optional[asyncio.Future] = None
+        self._crypto_names: Set[str] = set()            # the catalogue's Crypto symbols, upper case
+        self._crypto_plain: Set[str] = set()            # the same without their slashes (BTCUSD)
+        self._tick_queue: Optional[asyncio.Queue] = None
+        self._stream_start: Optional[str] = None
         self._callbacks: Dict[str, List[Callable]] = {}
         self._symbols: List[dict] = []
         self._tier: str = ""
@@ -331,37 +353,31 @@ class LSE(Data3Mixin):
     # ------------------------------------------------------------------
 
     def stream(self, symbols: List[str], reconnect: bool = True, start: Optional[str] = None) -> Iterator[Tick]:
-        """Stream ticks. Blocks forever, yields Tick objects.
+        """Stream live ticks. Blocks forever, yields Tick objects.
 
-        If start is provided, the server replays historical ticks from that
-        time first (with tick.replay=True), then transitions to live data on
-        the same connection.
+        On the default address the crypto symbols of the list are served by
+        the crypto socket (CRYPTO_WS_URL) and everything else by the default
+        one; the ticks of both arrive in this one loop.
 
         Args:
             symbols: List of symbols to subscribe to (e.g. ["BTC/USD", "AAPL"]).
             reconnect: If True, automatically reconnect on disconnect.
-            start: Optional start of a replay: an ISO 8601 time in UTC
-                   (e.g. "2026-10-24T09:00:00") or an epoch timestamp, at most
-                   24 hours back. The server replays ticks from this point,
-                   then switches to live.
+            start: No longer served. The sockets carry live ticks only since
+                   25 October 2026, when replay was removed: a ``start`` is
+                   refused by the server, and the refusal is raised as
+                   LSEError (code ``REPLAY_REMOVED``) with the server's
+                   sentence. For history use candles(), rows() or export().
 
         Yields:
-            Tick objects as they arrive (replay ticks first, then live).
+            Tick objects as they arrive.
 
         Example:
             from lse import LSE
 
             client = LSE(api_key="your_key")
 
-            # Live only
-            for tick in client.stream(["BTC/USD"]):
+            for tick in client.stream(["BTC/USD", "AAPL"]):
                 print(f"{tick.symbol}: ${tick.price}")
-
-            # Replay the last 2 hours, then live
-            from datetime import datetime, timedelta, timezone
-            start = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
-            for tick in client.stream(["BTC/USD"], start=start):
-                print(f"{'REPLAY' if tick.replay else 'LIVE'} {tick.symbol}: ${tick.price}")
         """
         self._disconnect_requested = False
         while not self._disconnect_requested:
@@ -396,12 +412,15 @@ class LSE(Data3Mixin):
                             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                     loop.close()
                     self._loop = None
+            except LSEError:
+                # A refusal no reconnect can change (a replay asked for): raised, not retried.
+                raise
             except Exception as e:
                 self._emit("error", str(e))
             # Stop on an explicit disconnect(), a fatal error (which sets
             # _disconnect_requested), or when auto-reconnect is off. This check
             # runs for BOTH a clean end and an exception, so a disconnect during
-            # a stream()/replay loop exits instead of silently reconnecting.
+            # a stream() loop exits instead of silently reconnecting.
             if self._disconnect_requested or not reconnect:
                 return
             time.sleep(3)
@@ -423,15 +442,13 @@ class LSE(Data3Mixin):
     def subscribe(self, symbols: List[str]):
         """Subscribe to more symbols. Works before connect() or stream() and
         while connected: the client sends them once it is authenticated, and
-        again after a reconnect.
+        again after a reconnect. On the default address a crypto symbol is
+        subscribed on the crypto socket, which is opened if it is not yet.
         """
         for sym in symbols:
             self._subscriptions.add(sym)
             if self._ws and self._loop:
-                asyncio.run_coroutine_threadsafe(
-                    self._ws.send(json.dumps({"action": "subscribe", "symbol": sym})),
-                    self._loop,
-                )
+                asyncio.run_coroutine_threadsafe(self._send_symbol("subscribe", sym), self._loop)
 
     def unsubscribe(self, symbols: List[str]):
         """Unsubscribe from symbols. Stops receiving ticks for these symbols.
@@ -448,10 +465,7 @@ class LSE(Data3Mixin):
         for sym in symbols:
             self._subscriptions.discard(sym)
             if self._ws and self._loop:
-                asyncio.run_coroutine_threadsafe(
-                    self._ws.send(json.dumps({"action": "unsubscribe", "symbol": sym})),
-                    self._loop,
-                )
+                asyncio.run_coroutine_threadsafe(self._send_symbol("unsubscribe", sym), self._loop)
 
     def subscribe_options(self, underlyings: List[str]):
         """Subscribe to options chains for the given underlying symbols.
@@ -511,14 +525,17 @@ class LSE(Data3Mixin):
             client.connect(["BTC/USD"])  # returns after disconnect()
         """
         self._disconnect_requested = True
-        # Close the live WebSocket so the receive loop exits immediately
-        if self._ws:
+        # Close the live WebSocket so the receive loop exits immediately; the
+        # crypto socket beside it, when there is one, goes the same way.
+        for ws in (self._ws, self._crypto_ws):
+            if not ws:
+                continue
             if self._loop and self._loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+                asyncio.run_coroutine_threadsafe(ws.close(), self._loop)
             else:
                 # Fallback: force-close the underlying transport
                 try:
-                    self._ws.transport.close()
+                    ws.transport.close()
                 except Exception:
                     pass
 
@@ -674,6 +691,15 @@ class LSE(Data3Mixin):
                 return str(day)
             return f"{day + one if upper else day} 00:00:00"
 
+        # A calendar candle can cross an arbitrary day-span boundary. In
+        # particular, exchange days can begin on the preceding UTC date, so
+        # timestamp-bounded daily reads cannot be divided at UTC midnight.
+        # Read these already-aggregated rows once, preserving the caller's
+        # outer bounds; their histories are small compared with intraday bars.
+        if timeframe in ("1w", "1mo") or (timeframe == "1d" and timed):
+            rows = self.rows(market, symbol, timeframe, edge(lo, False), edge(hi, True), adjusted=adjusted)
+            return rows[:limit] if forward else rows[-limit:]
+
         rows: List[dict] = []
         step, missing = base, None
         a, b = (lo, min(hi, lo + base)) if forward else (max(lo, hi - base), hi)
@@ -684,8 +710,24 @@ class LSE(Data3Mixin):
                 if e.code not in ("data-unavailable", "date-not-trading"):
                     raise
                 part, missing = [], e
-            rows = rows + part if forward else part + rows
-            if len(rows) >= limit or (b >= hi if forward else a <= lo):
+            left, right = (rows, part) if forward else (part, rows)
+            # Date windows use exchange sessions; UTC intraday buckets may
+            # straddle their boundary. The requests cover disjoint spans, so
+            # the matching edge rows are two pieces of the same candle.
+            if left and right and left[-1].get("time") == right[0].get("time"):
+                first, last = left[-1], right[0]
+                joined = dict(first)
+                joined.update(high=max(first["high"], last["high"]),
+                              low=min(first["low"], last["low"]), close=last["close"])
+                for field in ("volume", "trades"):
+                    if field in first and field in last:
+                        joined[field] = first[field] + last[field]
+                rows = left[:-1] + [joined] + right[1:]
+            else:
+                rows = left + right
+            # With exactly limit rows the edge candle may still be partial.
+            # One further distinct row proves the requested slice is complete.
+            if len(rows) > limit or (b >= hi if forward else a <= lo):
                 break
             step = base if part else step * 2
             a, b = (b + one, min(hi, b + one + step)) if forward else (max(lo, a - one - step), a - one)
@@ -1138,7 +1180,7 @@ class LSE(Data3Mixin):
                 format: str = "parquet", adjusted: bool = True, data: str = "candles",
                 pair_id=None, progress: Optional[Callable] = None, timeout: float = 1800.0,
                 poll_seconds: Optional[float] = None):
-        """Pull history as a file, resumable and checked.
+        """Pull history as a file, checked by SHA-256.
 
         ``history("AAPL", timeframe="1d", start="2020-01-01", end="2026-10-01")``
         resolves the market from the catalogue; pass ``market=`` when a symbol
@@ -1183,12 +1225,13 @@ class LSE(Data3Mixin):
     # ------------------------------------------------------------------
 
     async def stream_async(self, symbols: List[str], reconnect: bool = True, start: Optional[str] = None):
-        """Async generator that yields Tick objects.
+        """Async generator that yields live Tick objects.
 
         Args:
             symbols: List of symbols to subscribe to.
             reconnect: If True, automatically reconnect on disconnect.
-            start: Optional start time for historical replay (ISO 8601 or epoch).
+            start: No longer served: replay was removed on 25 October 2026.
+                   The server's refusal is raised as LSEError (``REPLAY_REMOVED``).
 
         Yields:
             Tick objects as they arrive.
@@ -1209,6 +1252,9 @@ class LSE(Data3Mixin):
             try:
                 async for tick in self._stream_once(symbols, start=start):
                     yield tick
+            except LSEError:
+                # A refusal no reconnect can change (a replay asked for): raised, not retried.
+                raise
             except Exception as e:
                 self._emit("error", str(e))
                 self._emit("disconnected")
@@ -1227,121 +1273,283 @@ class LSE(Data3Mixin):
     async def disconnect_async(self):
         """Async version of disconnect(). Call from within an async context."""
         self._disconnect_requested = True
-        if self._ws:
-            await self._ws.close()
+        for ws in (self._ws, self._crypto_ws):
+            if ws:
+                await ws.close()
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     async def _stream_once(self, symbols: List[str], start: Optional[str] = None):
-        """Single connection session. Yields ticks until disconnect."""
+        """Single connection session. Yields ticks until disconnect.
+
+        The socket is read by a task of its own that hands its ticks to this
+        generator, so that on the default address a second task can read the
+        crypto socket beside it and both arrive in one loop. The session ends
+        when the main socket does."""
         # Store the event loop so sync methods (subscribe, disconnect) can
         # schedule coroutines from other threads via run_coroutine_threadsafe
         self._loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_TICK_QUEUE)
+        self._tick_queue, self._stream_start, self._crypto_task = queue, start, None
+        main = asyncio.ensure_future(self._main_session(symbols, start, queue))
+        try:
+            while True:
+                kind, value = await queue.get()
+                if kind == "tick":
+                    self._emit("tick", value)
+                    yield value
+                elif value is not None:
+                    raise value         # the socket failed, or refused what was asked
+                else:
+                    return              # the socket closed
+        finally:
+            tasks = [t for t in (main, self._crypto_task) if t is not None]
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._tick_queue = self._crypto_task = None
 
-        async with websockets.connect(
-            self._url,
-            ping_interval=PING_INTERVAL,
-            ping_timeout=30,
-        ) as ws:
-            self._ws = ws
-            self._authenticated = False
+    @staticmethod
+    def _tick_of(msg: dict) -> Tick:
+        # Option contracts arrive with OSI symbols; from_symbol upgrades those
+        # to OptionTick (parsed strike/expiry/right) and returns a plain Tick
+        # for everything else.
+        return OptionTick.from_symbol(
+            symbol=msg.get("symbol", ""),
+            price=msg.get("price", 0.0),
+            bid=msg.get("bid"),
+            ask=msg.get("ask"),
+            volume=msg.get("volume"),
+            timestamp=msg.get("ts"),
+            name=msg.get("name"),
+            replay=msg.get("replay", False),
+        )
 
-            # Wait for welcome
-            raw = await ws.recv()
-            msg = json.loads(raw)
-            if msg.get("type") == "welcome":
-                self._emit("connected")
+    @staticmethod
+    def _replay_refusal(msg: dict) -> LSEError:
+        return LSEError(410, str(msg.get("message") or "Replay has been removed."), "REPLAY_REMOVED")
 
-            # Authenticate
-            await ws.send(json.dumps({
-                "action": "auth",
-                "api_key": self._api_key,
-            }))
+    # ── crypto on the default address ──────────────────────────────────
 
-            # Start keepalive pings in background
-            ping_task = asyncio.create_task(self._ping_loop(ws))
+    def _learn_crypto(self, catalogue) -> None:
+        """Which symbols are crypto, from the catalogue the socket sends when
+        it authenticates: the rows whose category is Crypto."""
+        if not self._route_crypto:
+            return
+        listed, names = set(), set()
+        for row in catalogue or []:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").upper()
+            listed.add(sym)
+            if str(row.get("category") or "").lower() == "crypto":
+                names.add(sym)
+        self._crypto_names = names
+        # The server reads BTCUSD as BTC/USD unless BTCUSD is itself listed.
+        self._crypto_plain = {n.replace("/", "") for n in names if "/" in n} - listed
 
-            try:
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    msg_type = msg.get("type")
+    def _is_crypto(self, symbol) -> bool:
+        """Whether this client sends a symbol to the crypto socket: only on
+        the default address, and only what its catalogue lists as Crypto."""
+        if not self._route_crypto:
+            return False
+        sym = str(symbol).upper()
+        return sym in self._crypto_names or ("/" not in sym and len(sym) >= 5 and sym in self._crypto_plain)
 
-                    if msg_type == "authenticated":
-                        self._authenticated = True
-                        self._tier = msg.get("tier", "")
-                        self._symbols = msg.get("symbols", [])
-                        self._emit("authenticated")
+    def _start_crypto(self) -> None:
+        """Open the crypto socket beside the default one, unless it is open."""
+        task = self._crypto_task
+        if self._tick_queue is not None and (task is None or task.done()):
+            self._crypto_task = asyncio.ensure_future(self._crypto_session(self._tick_queue, self._stream_start))
 
-                        # Subscribe to everything in _subscriptions: the symbols
-                        # passed to connect() or stream() and any added with
-                        # subscribe(), so subscriptions made before connecting or
-                        # before a reconnect take effect. Option underlyings follow.
-                        for sym in symbols:
-                            self._subscriptions.add(sym)
-                        for sym in self._subscriptions:
-                            sub_msg = {"action": "subscribe", "symbol": sym}
-                            if start:
-                                sub_msg["start"] = start
-                            await ws.send(json.dumps(sub_msg))
+    async def _send_symbol(self, action: str, symbol: str) -> None:
+        """One subscribe or unsubscribe, on the socket that serves the symbol."""
+        ws = self._ws
+        if self._is_crypto(symbol):
+            if action == "subscribe":
+                self._start_crypto()
+            # Until the crypto socket has authenticated there is nothing to
+            # send on: it subscribes everything in _subscriptions when it does.
+            ws = self._crypto_ws
+        if ws:
+            await ws.send(json.dumps({"action": action, "symbol": symbol}))
 
-                        # Re-subscribe to any option underlyings that were
-                        # added via subscribe_options() before connect, or
-                        # that need restoring after a reconnect
-                        for underlying in self._option_underlyings:
-                            await ws.send(json.dumps({
-                                "action": "subscribe_options",
-                                "underlying": underlying,
-                            }))
-
-                    elif msg_type == "tick":
-                        # Option contracts arrive with OSI symbols; from_symbol
-                        # upgrades those to OptionTick (parsed strike/expiry/right)
-                        # and returns a plain Tick for everything else.
-                        tick = OptionTick.from_symbol(
-                            symbol=msg.get("symbol", ""),
-                            price=msg.get("price", 0.0),
-                            bid=msg.get("bid"),
-                            ask=msg.get("ask"),
-                            volume=msg.get("volume"),
-                            timestamp=msg.get("ts"),
-                            name=msg.get("name"),
-                            replay=msg.get("replay", False),
-                        )
-                        self._emit("tick", tick)
-                        yield tick
-
-                    elif msg_type == "replay_complete":
-                        # Historical replay finished, live ticks follow
-                        self._emit("replay_complete", msg)
-
-                    elif msg_type == "replay_started":
-                        # Server confirmed replay is starting
-                        self._emit("replay_started", msg)
-
-                    elif msg_type == "error":
-                        code = msg.get("code", "")
-                        self._emit("error", msg.get("message", "Unknown error"))
-                        # Fatal errors will never succeed on retry: a bad/inactive
-                        # key, or a key the server refuses to serve. Any
-                        # error that arrives before we authenticate is fatal too.
-                        # Stop the (re)connect loop instead of hammering forever.
-                        if code in ("INVALID_KEY", "MISSING_KEY", "QUOTA_EXCEEDED") or not self._authenticated:
-                            self._disconnect_requested = True
-                            break
-
-                    elif msg_type in ("pong", "unsubscribed", "subscribed",
-                                      "options_subscribed", "options_unsubscribed"):
-                        # Server confirmations for lifecycle actions. No user
-                        # action needed; the local state was already updated
-                        # when the corresponding method was called.
-                        pass
-
-            finally:
-                ping_task.cancel()
-                self._ws = None
+    async def _main_session(self, symbols: List[str], start: Optional[str], queue: asyncio.Queue) -> None:
+        """The client's socket: authenticate, subscribe, hand each tick to
+        the queue, and say how the session ended."""
+        ended: Optional[BaseException] = None
+        try:
+            async with websockets.connect(
+                self._url,
+                ping_interval=PING_INTERVAL,
+                ping_timeout=30,
+            ) as ws:
+                self._ws = ws
                 self._authenticated = False
+
+                # Wait for welcome
+                raw = await ws.recv()
+                msg = json.loads(raw)
+                if msg.get("type") == "welcome":
+                    self._emit("connected")
+
+                # Authenticate
+                await ws.send(json.dumps({
+                    "action": "auth",
+                    "api_key": self._api_key,
+                }))
+
+                # Start keepalive pings in background
+                ping_task = asyncio.ensure_future(self._ping_loop(ws))
+
+                try:
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        msg_type = msg.get("type")
+
+                        if msg_type == "authenticated":
+                            self._authenticated = True
+                            self._tier = msg.get("tier", "")
+                            self._symbols = msg.get("symbols", [])
+                            self._learn_crypto(self._symbols)
+                            self._emit("authenticated")
+
+                            # Subscribe to everything in _subscriptions: the symbols
+                            # passed to connect() or stream() and any added with
+                            # subscribe(), so subscriptions made before connecting or
+                            # before a reconnect take effect. Option underlyings follow.
+                            # On the default address the crypto symbols are left to
+                            # the crypto socket, opened here when there are any.
+                            for sym in symbols:
+                                self._subscriptions.add(sym)
+                            crypto = False
+                            for sym in list(self._subscriptions):
+                                if self._is_crypto(sym):
+                                    crypto = True
+                                    continue
+                                sub_msg = {"action": "subscribe", "symbol": sym}
+                                if start:
+                                    sub_msg["start"] = start
+                                await ws.send(json.dumps(sub_msg))
+                            if crypto:
+                                self._start_crypto()
+
+                            # Re-subscribe to any option underlyings that were
+                            # added via subscribe_options() before connect, or
+                            # that need restoring after a reconnect
+                            for underlying in list(self._option_underlyings):
+                                await ws.send(json.dumps({
+                                    "action": "subscribe_options",
+                                    "underlying": underlying,
+                                }))
+
+                        elif msg_type == "tick":
+                            await queue.put(("tick", self._tick_of(msg)))
+
+                        elif msg_type == "replay_complete":
+                            self._emit("replay_complete", msg)
+
+                        elif msg_type == "replay_started":
+                            self._emit("replay_started", msg)
+
+                        elif msg_type == "error":
+                            code = msg.get("code", "")
+                            self._emit("error", msg.get("message", "Unknown error"))
+                            if code == "REPLAY_REMOVED":
+                                # The sockets carry live ticks only: a subscribe with a
+                                # start is refused and nothing follows it. Raise the
+                                # server's sentence instead of streaming nothing.
+                                self._disconnect_requested = True
+                                ended = self._replay_refusal(msg)
+                                break
+                            # Fatal errors will never succeed on retry: a bad/inactive
+                            # key, or a key the server refuses to serve. Any
+                            # error that arrives before we authenticate is fatal too.
+                            # Stop the (re)connect loop instead of hammering forever.
+                            if code in ("INVALID_KEY", "MISSING_KEY", "QUOTA_EXCEEDED") or not self._authenticated:
+                                self._disconnect_requested = True
+                                break
+
+                        elif msg_type in ("pong", "unsubscribed", "subscribed",
+                                          "options_subscribed", "options_unsubscribed"):
+                            # Server confirmations for lifecycle actions. No user
+                            # action needed; the local state was already updated
+                            # when the corresponding method was called.
+                            pass
+
+                finally:
+                    ping_task.cancel()
+                    self._ws = None
+                    self._authenticated = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            ended = e
+        await queue.put(("end", ended))
+
+    async def _crypto_session(self, queue: asyncio.Queue, start: Optional[str]) -> None:
+        """The crypto socket beside the default one: the same key, the crypto
+        symbols of this client's subscriptions, their ticks into the same
+        queue. It reconnects by itself while the main session lives; what it
+        is refused goes to the "error" callbacks with the socket's address,
+        and the default socket carries on."""
+        where = f" ({self._crypto_url})"
+        while not self._disconnect_requested:
+            refused = False
+            try:
+                async with websockets.connect(
+                    self._crypto_url,
+                    ping_interval=PING_INTERVAL,
+                    ping_timeout=30,
+                ) as ws:
+                    await ws.recv()  # welcome
+                    await ws.send(json.dumps({"action": "auth", "api_key": self._api_key}))
+                    ping_task = asyncio.ensure_future(self._ping_loop(ws))
+                    authenticated = False
+                    try:
+                        async for raw in ws:
+                            msg = json.loads(raw)
+                            msg_type = msg.get("type")
+                            if msg_type == "authenticated":
+                                authenticated = True
+                                self._crypto_ws = ws
+                                for sym in list(self._subscriptions):
+                                    if self._is_crypto(sym):
+                                        sub_msg = {"action": "subscribe", "symbol": sym}
+                                        if start:
+                                            sub_msg["start"] = start
+                                        await ws.send(json.dumps(sub_msg))
+                            elif msg_type == "tick":
+                                await queue.put(("tick", self._tick_of(msg)))
+                            elif msg_type == "error":
+                                code = msg.get("code", "")
+                                self._emit("error", str(msg.get("message", "Unknown error")) + where)
+                                if code == "REPLAY_REMOVED":
+                                    self._disconnect_requested = True
+                                    await queue.put(("end", self._replay_refusal(msg)))
+                                    return
+                                # As on the main socket: a key this socket will not
+                                # serve is not asked again.
+                                if code in ("INVALID_KEY", "MISSING_KEY", "QUOTA_EXCEEDED") or not authenticated:
+                                    refused = True
+                                    break
+                    finally:
+                        ping_task.cancel()
+                        self._crypto_ws = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if not self._disconnect_requested:
+                    self._emit("error", f"{e}{where}")
+            if refused or self._disconnect_requested:
+                return
+            await asyncio.sleep(3)
 
     async def _run_forever(self, symbols: List[str]):
         """Connect, subscribe, and dispatch events forever with auto-reconnect.

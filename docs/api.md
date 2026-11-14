@@ -69,22 +69,45 @@ and its HTTP status says the kind: 400 the request is wrong, 401 the key, 403 th
 The refusal codes are listed at the end. Browsers may call the server only from LSE's own website, so call it from
 your own code, not from a web page on another site.
 
-**Files.** An export answers either the bytes at once (200, `Content-Disposition` with the file name, the job id in
-`x-export-job`, `x-export-status-url`, and `x-lse3-adjusted` 1 or 0) or a prepared job (202, the job object) when the
-file could exceed 100 MB (`ceiling_bytes` in the estimate), the build has not finished within 10 seconds, or
-`prepare=1` was asked. A job lives 24 hours
-(`expires_at`, Unix seconds); `/v3/jobs/<id>` tells its state and `/v3/jobs/<id>/file` gives the file, whole or by
-`Range`, with an ETag of the SHA-256 and `x-checksum-sha256`. Only the key that made a job sees it: any other key, and
-a malformed id, is told `404 export-unknown`. A selection with no stored rows answers `404 data-unavailable` instead of
-an empty file. Parquet files type `size` as double, because split-adjusted volumes can be fractional.
+**Files.** An export answers the bytes at once: `200` with `Content-Disposition` naming the file, `Content-Length`,
+`x-checksum-sha256` (the file's SHA-256), `x-export-id` (the server's name for this export in its log), `x-export-rows`
+(the rows it charged) and `x-lse3-adjusted` 1 or 0. The file is built whole before the first byte goes out, so the
+size and checksum are exact, and nothing is kept once it has been sent (since 2026-11-06; before it a large or slow
+export became a prepared job kept 24 hours). `prepare=1` is accepted and ignored. `/v3/jobs/<id>` and
+`/v3/jobs/<id>/file`, the prepared-file routes of before, answer `404 export-unknown`: a download that was cut is
+requested again from the start. A selection with no stored rows answers `404 data-unavailable` instead of an empty
+file; its message begins "No stored data for this selection" and says why. Parquet files type `size` as double,
+because split-adjusted volumes can be fractional.
 
 **One download at a time.** A key has one download open at a time, on every plan. While an export of this key is
-streaming, or a job of its is building, or a job's file is being fetched, one more `/v3/export`, `/v3/dataset/export`,
-macro or reference export, or `/v3/jobs/<id>/file` answers `429 connections-exhausted` (`429 exports-busy` while the
-first is still building), with the message "One download at a time. <file> is still coming." naming the file to wait
-for; the same request once the first is done goes through. The bytes are paced per key: 50 Mbit/s
-on the free plan, 500 Mbit/s on a paid plan. `GET /v3/usage` shows the pair as `rate_mbit` and `connections`, and `open`
-says whether a download is running now.
+being built or sent, one more `/v3/export`, `/v3/dataset/export`, macro or reference export answers
+`429 connections-exhausted` (`429 exports-busy` while the first is still building), with the message "One download at a
+time. <file> is still coming." naming the file to wait for, and `Retry-After: 5`; the same request once the first is
+done goes through. The bytes are paced per key: 50 Mbit/s on the free plan, 250 Mbit/s on a paid plan.
+`GET /v3/usage` shows the pair as `rate_mbit` and `connections`, and `open` says whether a download is running now.
+
+**Rows an export and rows a day.** Every export is measured in rows before it is built, and the plan sets two
+figures, which `GET /v3/usage` reports under `rows`:
+
+| Plan | Rows one export may read | Rows a day |
+|---|---|---|
+| Free | 2,500,000 | 12,500,000, reset at 00:00 UTC |
+| Paid tiers | 2,500,000 | no daily limit |
+
+An export past the first answers `413 export-too-wide` before anything is built, with both figures in the sentence;
+so does one the server could not measure within 10 seconds. Past the rows a day it answers `429 rows-exhausted`, with
+`Retry-After` and `retry_after` giving the seconds to 00:00 UTC. Nothing is charged for a selection with no rows or
+for a refused export. Ask for a long history in pieces: `/v3/estimate` says how many rows a selection holds.
+
+```text
+GET /v3/export?market=us_stocks&symbol=AAPL&timeframe=1m&from=2003-01-01&to=2026-10-24&format=csv
+413  {"code": "export-too-wide", "message": "This export would read 4,132,206 rows; your plan allows at most 2,500,000 rows an export. Choose shorter dates."}
+
+429  {"code": "rows-exhausted", "message": "Your plan allows 12,500,000 rows a day; 11,900,000 are used and this export would read 6,743. It resets at 00:00 UTC, in 5 h 12 min.", "retry_after": 18720}
+```
+
+The free plan also has a weekly allowance of 12.5 GiB, counted on the bytes of its exports; past it every export
+answers `429 allowance-exhausted` until Monday 00:00 UTC. A paid plan has none.
 
 **What an answer says about you.** No answer carries an email, a user id or a person's name. The one thing a caller
 learns about itself is in `/v3/usage`: the key's own name as it was typed on the Data page, its plan and its product.
@@ -110,16 +133,21 @@ GET /v3/health
 What this key may do and has used. No parameters. Answers `key` (the key's name as it was typed on the Data page),
 `plan`, `product`, `markets` (the enabled markets the key opens), `rate_mbit`, `connections` (downloads at once),
 `open` (downloads running now), `bytes_since_start`, `calls_per_minute`, `levels` and `history` per paid market (`l1`,
-`l2`, `l3` months, -1 the whole archive, and the tier's label), `weekly` (`allowance_bytes`, -1 for a paid plan;
-`used_bytes`; `week` as `2026-W43`) and `withheld` (null, or the sentence that explains why every download is refused).
+`l2`, `l3` months, -1 the whole archive, and the tier's label), `rows` (`per_export`; `per_day`, -1 for a paid plan;
+`used_today`; `day`; `resets_in_seconds`), `weekly` (`allowance_bytes`, -1 for a paid plan; `used_bytes`; `week` as
+`2026-W46`) and `withheld` (null, or the sentence that explains why every download is refused).
 
 ```text
 GET /v3/usage                                                   (a free key)
 {"key": "Default", "plan": "free", "product": "global",
  "markets": ["us_stocks", "uk_stocks", "ca_stocks", "forex", "crypto", "futures", "indices", "commodities", "us_options"],
- "rate_mbit": 50.0, "connections": 1, "open": 0, "bytes_since_start": 0, "calls_per_minute": 60, "levels": {}, "history": {},
- "weekly": {"allowance_bytes": 13421772800, "used_bytes": 385, "week": "2026-W43"}, "withheld": null}
+ "rate_mbit": 50.0, "connections": 1, "open": 0, "bytes_since_start": 29818, "calls_per_minute": 60, "levels": {}, "history": {},
+ "rows": {"day": "2026-11-11", "per_day": 12500000, "per_export": 2500000, "resets_in_seconds": 61553, "used_today": 996029},
+ "weekly": {"allowance_bytes": 13421772800, "used_bytes": 14457484, "week": "2026-W46"}, "withheld": null}
 ```
+
+A key of a paid tier reads `"rate_mbit": 250.0`, `"rows": {"per_day": -1, "per_export": 2500000, ...}` and
+`"weekly": {"allowance_bytes": -1, ...}`.
 
 A key whose subscription ended reads `"plan": "cme:ended", "markets": [], "withheld": "your CME Group subscription has
 ended; renew it to download CME Group data"`.
@@ -428,7 +456,7 @@ Trades, quotes, orders and book exist on the paid feeds only; on the included ma
 `400 data-unavailable` ("This market offers timeframes, including tick"). Forex and commodities are priced from quotes,
 not trades, so they have candles but no trade slice: `tick` on them answers `404 data-unavailable`. Candles are `time, open, high, low, close, volume, trades`; a daily, weekly or
 monthly candle's `time` is the start of its first minute with a trade, in UTC (AAPL's 1 October 2026 candle reads
-`2026-10-01 04:02:00`). Trades are `time, price, size, kind`; quotes `time, bid_price, ask_price, bid_size, ask_size`;
+`2026-10-01 04:02:00`), and it carries one more column, `date`: the session's date, or the first day of its week or month. Trades are `time, price, size, kind`; quotes `time, bid_price, ask_price, bid_size, ask_size`;
 orders `time, action, side, order_id, price, size`. The book is 67 columns: `time`, `sequence`, `action`, `side`, `price`, `size`, `depth`, then
 ten bid and ten ask levels of price, size and orders. Greeks are one row per traded minute with `price_at`, `iv`,
 `delta`, `gamma`, `theta`, `vega`, `option_price`, `price_source`, `underlying_price`, `years_to_expiry`, `rate` and
@@ -450,9 +478,10 @@ GET /v3/preview?market=us_stocks&symbol=AAPL&timeframe=5m&data=candles
 
 #### GET /v3/estimate
 
-The rows and bytes an export would have. Answers `rows`, `estimated_bytes` (the expected size of the file, usually a
-little above it), `ceiling_bytes` (the most the file can weigh: above 100 MB the export is prepared as a job), `mode`
-(`stream` or `file`), `filename`, `availability` and `message`. Without `from` and `to` it describes the same
+The rows and bytes an export would have. Answers `rows`, `basis` (what was counted), `estimated_bytes` (the expected
+size of the file, usually a little above it), `ceiling_bytes` (the most the file can weigh), `mode` (`stream` or
+`file`, a field kept from the prepared jobs of before: every export is now sent at once), `filename`, `availability`
+and `message`. `rows` is the figure the rows limits are judged on. Without `from` and `to` it describes the same
 newest-ten-rows window the preview shows, with `latest_latest` in the file name.
 
 A selection of a paid market the key may not download (no plan, a level the tier does not sell, dates before the plan's
@@ -471,67 +500,51 @@ GET /v3/estimate?market=nasdaq&symbol=NVDA&timeframe=tick&data=orders&from=2026-
 
 ```text
 GET /v3/estimate?market=us_stocks&symbol=AAPL&timeframe=5m&from=2026-10-08&to=2026-10-14&format=csv&adjusted=1&data=candles
-{"rows": 1021, "estimated_bytes": 89896, "ceiling_bytes": 261568, "mode": "stream", "filename": "AAPL_us_stocks_5m_2026-10-08_2026-10-14.csv", "message": null, ...}
+{"rows": 1041, "estimated_bytes": 91336, "ceiling_bytes": 265408, "mode": "stream", "filename": "AAPL_us_stocks_5m_2026-10-08_2026-10-14.csv", "message": null, ...}
 
 GET /v3/estimate?market=us_stocks&symbol=AAPL&timeframe=5m&from=2026-10-17&to=2026-10-18     (a weekend)
-{"rows": 0, "estimated_bytes": 0, "ceiling_bytes": 0, "mode": "stream", "message": "...", ...}
+{"rows": 0, "estimated_bytes": 0, "ceiling_bytes": 0, "mode": "stream",
+ "message": "No stored data for this selection: no candles of AAPL (pair 2000000040) are stored in the dates asked (no trading then, or dates not loaded).", ...}
 ```
 
 #### GET /v3/export, and /v3/candles
 
-The file. `/v3/candles` is a second name for the same call. `prepare=1` asks for a job even when the file is small.
-A stream (200) carries the bytes with `Content-Disposition`, `x-export-job`, `x-export-status-url` and
-`x-lse3-adjusted`; when the build finished before the first byte went out it also carries `Content-Length` and
-`x-checksum-sha256`. A job (202) is the job object. A selection with no rows answers `404 data-unavailable`. The
-weekly allowance of a free key is counted against exports and job files; past it every export answers
-`429 allowance-exhausted` with the figures: "Your plan's weekly allowance of 12.5 GiB is used up (12.54 GiB this week);
-it resets Monday 00:00 UTC. A paid plan has no weekly allowance."
+The file, by the file rules above. `/v3/candles` is a second name for the same call; `prepare=1` is accepted and
+ignored. The answer (200) carries the bytes with `Content-Disposition`, `Content-Length`, `x-checksum-sha256`,
+`x-export-id`, `x-export-rows` and `x-lse3-adjusted`. A selection with no rows answers `404 data-unavailable`; an
+export past the rows one export may read `413 export-too-wide`; past the free plan's rows a day `429 rows-exhausted`;
+past its weekly allowance `429 allowance-exhausted` with the figures: "Your plan's weekly allowance of 12.5 GiB is
+used up (12.54 GiB this week); it resets Monday 00:00 UTC. A paid plan has no weekly allowance." A daily, weekly or
+monthly candle carries its session's `date` as a last column.
 
 ```text
 GET /v3/export?market=us_stocks&symbol=AAPL&timeframe=1d&from=2026-10-01&to=2026-10-14&format=csv&adjusted=1&data=candles
-200  content-type: text/csv; charset=utf-8
+200  content-type: text/csv; charset=utf-8   content-length: 851
      content-disposition: attachment; filename="AAPL_us_stocks_1d_2026-10-01_2026-10-14.csv"
-     x-export-job: dd0524aed651425ba2a89572dfdaa0d1   x-export-status-url: /v3/jobs/dd0524aed651425ba2a89572dfdaa0d1   x-lse3-adjusted: 1
-"time","open","high","low","close","volume","trades"
-"2026-10-01 04:02:00",334.18,334.83,325.82,330.79,15666143,265910
-"2026-10-02 04:00:00",331.14,334.54,330.17,333.53,15026716,228816
-...  10 rows, 715 bytes
+     x-checksum-sha256: 05e6d3366eb6c948eb4dbc2460cb7b06c256d7992ec667dd0c88e8578055e812
+     x-export-id: 81ec941184f44427ade9e06cf33820bf   x-export-rows: 10   x-lse3-adjusted: 1
+"time","open","high","low","close","volume","trades","date"
+"2026-10-01 04:02:00",334.18,334.83,325.82,330.79,15666143,265910,"2026-10-01"
+"2026-10-02 04:00:00",331.14,334.54,330.17,333.53,15026716,228816,"2026-10-02"
+...  10 rows, 851 bytes
 
-GET /v3/export?...&format=csv&prepare=1
-202  {"job_id": "c5bb197f076943f591cba223141d4510", "status": "building", "bytes": 0, "checksum": null, "filename": "AAPL_us_stocks_1d_2026-10-01_2026-10-14.csv",
-      "expires_at": 1792808165, "category": "market", "status_url": "/v3/jobs/c5bb197f076943f591cba223141d4510", "download_url": "/v3/jobs/c5bb197f076943f591cba223141d4510/file",
-      "error": null, "progress": null, "phase": null}
+GET /v3/export?market=us_stocks&symbol=AAPL&timeframe=5m&from=2026-10-17&to=2026-10-18&format=csv     (a weekend)
+404  {"code": "data-unavailable", "message": "No stored data for this selection: no candles of AAPL (pair 2000000040) are stored in the dates asked (no trading then, or dates not loaded)."}
 
 GET /v3/export?market=us_stocks&symbol=AAA&timeframe=1d&from=2026-10-01&to=2026-10-14
 404  {"code": "data-unavailable", "message": "..."}
 ```
 
-With `format=parquet` the same selection is a 3,685-byte Parquet file (`application/vnd.apache.parquet`).
+With `format=parquet` the same selection is a 4,108-byte Parquet file (`application/vnd.apache.parquet`).
 
-#### GET /v3/jobs/{id}
+#### GET /v3/jobs/{id}, and /v3/jobs/{id}/file
 
-A job's state: `job_id`, `status` (`building`, `ready`, `failed`, `expired`), `bytes`, `checksum` (SHA-256 of the
-file), `filename`, `expires_at`, `category` (`market` or `macro`), `status_url`, `download_url`, `error`, `progress`
-and `phase`. The job must be this key's; the market of a market job must still be in the key's plan.
+The prepared-file routes of before 2026-11-06, when a large export became a job that was polled and then fetched.
+Exports are no longer kept after they are sent, so every id answers the same:
 
 ```text
 GET /v3/jobs/21a88b355dc84b6982d4da81328764dc
-{"job_id": "21a88b355dc84b6982d4da81328764dc", "status": "ready", "bytes": 14043, "checksum": "ce570f7a54a10bdfc1c79dd11fba922355fffe78120cd3332522feca7a6872d5",
- "filename": "AAPL_us_stocks_5m_2026-10-08_2026-10-08.csv", "expires_at": 1792808061, "category": "market", ...}
-
-GET /v3/jobs/abc, or another key's id          404 {"code": "export-unknown", "message": "Export is not available"}
-```
-
-#### GET /v3/jobs/{id}/file
-
-The file of a ready job, whole (200) or by `Range` (206), with `Content-Length`, `Accept-Ranges: bytes`, `ETag` (the
-checksum in quotes), `x-checksum-sha256`, and `Content-Range` on a range. `If-Range` with a different ETag gives the
-whole file (200). A range past the end answers 416 with `Content-Range: bytes */<length>` and no body. While the job
-is still building the answer is 202 with the job; a failed build `409 export-failed`.
-
-```text
-GET /v3/jobs/d4194e84ef3c4364ad18525e9d802e51/file   Range: bytes=0-99
-206  content-range: bytes 0-99/715   etag: "8eaf9f0d83ae7ca3ddd09e272d285fbc893949ea5a04c87aa02b6d0b1d84ffc0"   accept-ranges: bytes
+404  {"code": "export-unknown", "message": "Exports are no longer kept after they are sent. Request the export again."}
 ```
 
 #### Older calls
@@ -571,7 +584,7 @@ does not answer within 10 s `503 dataset-unavailable`.
 GET /v3/dataset/export?market=us_stocks&symbol=AAPL&timeframe=5m&from=2026-10-08&to=2026-10-13&indicators=rsi:14,sma:20
     &companion_market=us_stocks&companion_symbol=MSFT&companion_features=close,return,corr&corr_window=20
     &hour_start=10&hour_end=15&tz=America/New_York&day_of_week=monday,tuesday,wednesday,thursday,friday&format=csv
-200  content-length: 28080   x-checksum-sha256: 37e9ef05a409385e911fc67e79b1f972be72f313f571bd6c7da5c39b4e38141d
+200  content-length: 28112   x-checksum-sha256: 18e8d02d2d469c31f5fbd88a482a01d090b6547265a66b0aaf95856d1da3ab35
      content-disposition: attachment; filename="AAPL_us_stocks_5m_2026-10-08_2026-10-13_dataset.csv"
 time,open,high,low,close,volume,trades,rsi_14,sma_20,msft_close,msft_return,corr_msft
 2026-10-08 14:00:00,337.27,337.66,337.06,337.325,186128.0,3492,,,531.145,,
@@ -582,7 +595,7 @@ time,open,high,low,close,volume,trades,rsi_14,sma_20,msft_close,msft_return,corr
 
 A key of a CME Group or Nasdaq TotalView tier opens its market's candles, `trades` and `quotes` (Level 1, from Lite),
 `book` (Level 2) and `orders` (Level 3) as the tier sells them, within the tier's history months per level, lifts the free plan's weekly allowance
-and paces downloads at 500 Mbit/s instead of 50; one download at a time holds on every plan. Without the tier, its rows
+and its rows a day, and paces downloads at 250 Mbit/s instead of 50; one download at a time and 2,500,000 rows an export hold on every plan. Without the tier, its rows
 answer `403 plan-required` naming the cheapest tier; its figures (counts, dates, sizes and estimates) answer every key. The pricing page shows an
 illustrative sample of each feed's data and schema for anyone. The refusals a paid key meets are
 `403 history-limit` (dates before the window, the body naming `earliest` and the next tier), `403 level-required` (a
@@ -655,7 +668,7 @@ named in the text above (`required_plan`, `plan`, `level`, `levels`, `earliest`,
 | 400 | `underlying-required` | contract filters on a sweep |
 | 400 | `window-bad` | to not after from |
 | 400 | `window-too-wide` | a sweep over more than 7 days |
-| 400, 404 | `data-unavailable` | 400: trades, quotes, orders or book on an included market, or greeks outside us_options; 404: tick on a quotes-only market, a pair with no data yet, or a selection with no stored rows |
+| 400, 404 | `data-unavailable` | 400: trades, quotes, orders or book on an included market, or greeks outside us_options; 404: tick on a quotes-only market, a pair with no data yet, or a selection with no stored rows (the message begins "No stored data for this selection" and says why) |
 | 401 | `key-missing` | no key in X-API-Key or ?key= |
 | 401 | `key-unknown` | a key the server does not know |
 | 403 | `account-required` | a key that belongs to no account |
@@ -667,7 +680,7 @@ named in the text above (`required_plan`, `plan`, `level`, `levels`, `earliest`,
 | 403 | `plan-required` | a preview or an export of a paid market the key's plan does not open (its candles, trades, quotes, orders or book); required_plan names the cheapest tier |
 | 404 | `dataset-unknown` | a dataset id the reference catalogue does not list |
 | 404 | `date-not-trading` | cme or futures with no session in the dates asked |
-| 404 | `export-unknown` | an id this key did not make, or a malformed id |
+| 404 | `export-unknown` | /v3/jobs: exports are no longer kept after they are sent |
 | 404 | `file-unknown` | a kind and feed that name no market |
 | 404 | `level-not-served` | orders or book on a market whose levels do not include L3 or L2 |
 | 404 | `market-not-enabled` | a market switched off or coming soon; the message carries its label |
@@ -681,14 +694,15 @@ named in the text above (`required_plan`, `plan`, `level`, `levels`, `earliest`,
 | 404 | `theme-unknown` | theme not light or dark |
 | 404 | `underlying-unknown` | an underlying the market does not list |
 | 404, 503 | `dataset-unavailable` | 404: a reference dataset not available yet; 503: the dataset builder did not answer |
-| 409, 502 | `export-failed` | the build failed (502 while streaming; 409 on a job's file) |
-| 410 | `export-expired` | past its 24 hours |
+| 502 | `export-failed` | the build failed |
 | 410 | `export-required` | /v3/files and /v3/file, once the key passes the plan checks |
+| 413 | `export-too-wide` | an export past the rows one export may read (2,500,000 on every plan), or one the server could not measure within 10 seconds |
 | 413 | `series-window-too-wide` | more than 100,000 rows |
-| 429 | `allowance-exhausted` | a free key past its weekly bytes |
+| 429 | `allowance-exhausted` | a free key past its weekly bytes (12.5 GiB); it resets Monday 00:00 UTC |
 | 429 | `calls-exhausted` | past the plan's calls a minute; Retry-After says when |
-| 429 | `connections-exhausted` | one more download while this key's one download is still open: a stream, or a job's file being fetched |
-| 429, 503 | `exports-busy` | 503: every builder of the server is busy; 429: this key's one download is still building |
+| 429 | `connections-exhausted` | one more download while this key's one download is still open; Retry-After 5 |
+| 429 | `rows-exhausted` | past the plan's rows a day (12,500,000 on the free plan); Retry-After and retry_after give the seconds to 00:00 UTC |
+| 429, 503 | `exports-busy` | 429: this key's one download is still building (Retry-After 5); 503: the server's queue of waiting builds is full, or the export could not be measured just now (Retry-After 30) |
 | 502 | `dataset-failed` | the dataset build failed |
 | 502 | `query-invalid` | the data store refused the query as malformed |
 | 502, 503 | `catalogue-invalid` | the catalogue answered badly (502), or could not be loaded (503) |
@@ -698,7 +712,6 @@ named in the text above (`required_plan`, `plan`, `level`, `levels`, `earliest`,
 | 503 | `catalogue-busy` | too many catalogue reads at once |
 | 503 | `catalogue-unavailable` | the catalogue did not answer |
 | 503 | `estimate-unavailable` | the figures for a selection the key may not download could not be read |
-| 503 | `export-unavailable` | the job could not be written or its file not opened |
 | 503 | `overview-unavailable` | the overview figures could not be read |
 | 503 | `query-busy` | too many reads at once |
 | 504 | `macro-timeout` | past 25 seconds |
@@ -717,7 +730,8 @@ named in the text above (`required_plan`, `plan`, `level`, `levels`, `earliest`,
 | `factors(market, symbol)` | `/v3/factors` |
 | `overview(market, symbol)` | `/v3/overview` |
 | `preview()`, `estimate()` | `/v3/preview`, `/v3/estimate` |
-| `export()`, `history()`, `job()` | `/v3/export` and the job calls |
+| `export()`, `history()` | `/v3/export` |
+| `job()` | `/v3/jobs/{id}`, which no longer keeps anything |
 | `rows()`, `candles()`, `option_candles()` | `/v3/export` as CSV, held in memory |
 | `dataset_export()` | `/v3/dataset/export` |
 | `options_chain()`, `options()` | `/v3/options/chain` |
@@ -730,8 +744,14 @@ named in the text above (`required_plan`, `plan`, `level`, `levels`, `earliest`,
 
 `catalog()` covers every market, Nasdaq TotalView included, and lists the two contract markets by underlying.
 
-The client keeps the key in the header, follows no redirect, accepts a job's `download_url` only on the server's own
-origin, resumes an interrupted file with `Range` and `If-Range` from its `.part` file, and checks the size and the
-SHA-256 before it places the destination. A refusal raises `LSEError` with `status`, `code`, `message` and
-`required_plan`; an export that outlasts its `timeout` raises it with code `timeout`, and the same call again
-continues it.
+The client keeps the key in the header, follows no redirect, writes a download to a `.part` file beside the
+destination, asks again from the start when a transfer is cut, and checks the SHA-256 before it places the
+destination. A refusal raises `LSEError` with `status`, `code`, `message` and `required_plan`; an export that outlasts
+its `timeout` raises it with code `timeout`. On a `429` that carries a `Retry-After` of two minutes or less
+(`calls-exhausted`, `connections-exhausted`, `exports-busy`) the client waits that long once in a call and asks again,
+unless it was made with `wait_for_limit=False`; a refusal that stands is raised with the server's code and sentence.
+
+The same client streams live prices with the same key, `client.stream([...])`: the
+[WebSocket documentation](https://londonstrategicedge.com/websocket-documentation) describes the sockets. Crypto
+streams from `wss://london-ws.londonstrategicedge.com`, which a client on the default address opens beside the default
+socket for the crypto symbols it is asked for.

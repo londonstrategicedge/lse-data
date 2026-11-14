@@ -1,5 +1,5 @@
 """
-LSE Data 3.0 over HTTPS: the catalogue, previews, estimates, resumable file
+LSE Data 3.0 over HTTPS: the catalogue, previews, estimates, checked file
 exports, macro and reference data, options chains and flow, all from
 https://download.londonstrategicedge.com/v3 with the same key that streams.
 
@@ -34,7 +34,7 @@ TIMEFRAMES = ("tick", "1s", "5s", "15s", "30s", "1m", "3m", "5m", "15m", "30m",
 DATA_KINDS = ("candles", "trades", "quotes", "orders", "book", "greeks")
 MACRO_KINDS = ("observation", "yield", "release")
 _RETRY_STATUSES = frozenset((429, 500, 502, 503, 504))
-_USER_AGENT = "lse-data/3.0 (+https://londonstrategicedge.com)"
+_USER_AGENT = "lse-data/3.0.1 (+https://londonstrategicedge.com)"
 # Row reads (candles(), the reference readers) hold one export in memory.
 # Anything larger belongs in history() or export(), which write a file.
 _ROWS_MAX_BYTES = 256 << 20
@@ -149,18 +149,19 @@ class Data3Mixin:
         return url + (("&" if target.query else "?") + query if query else "")
 
     def _wait_out(self, retry_after) -> bool:
-        """Whether a 429 is waited out: once, for the server's Retry-After (at
-        most two minutes), when the client was made with wait_for_limit."""
-        if not getattr(self, "wait_for_limit", True) or getattr(self, "_waited", False):
-            self._waited = False
+        """Whether a 429 is waited out: for the server's Retry-After (at most
+        two minutes), when the client was made with wait_for_limit. Each call
+        waits at most once, and the wait is not one of its tries: the caller
+        keeps that count itself, so nothing is remembered from one call to
+        the next."""
+        if not getattr(self, "wait_for_limit", True):
             return False
         try:
             seconds = float(retry_after or 0)
-        except ValueError:
+        except (TypeError, ValueError):
             seconds = 0
         if not 0 < seconds <= 120:
             return False
-        self._waited = True
         time.sleep(seconds + 0.5)
         return True
 
@@ -177,23 +178,30 @@ class Data3Mixin:
 
     def _json(self, path: str, **params) -> Any:
         url = self._data_url(path, **params)
-        for attempt in range(self.retries + 1):
+        # Every pass ends in a return, a raise, or one more ask: a waited 429
+        # (once, and not a try) or a retry that uses up one of the tries. A
+        # refusal that outlasts them is raised with the server's own code.
+        attempt, waited = 0, False
+        while True:
             try:
                 with self._open(url) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as e:
                 status, body = e.code, e.read()
-                if status == 429 and self._wait_out(e.headers.get("Retry-After")):
+                if status == 429 and not waited and self._wait_out(e.headers.get("Retry-After")):
+                    waited = True
                     continue
                 if status in _RETRY_STATUSES and attempt < self.retries:
                     time.sleep(min(0.25 * 2 ** attempt, 2))
+                    attempt += 1
                     continue
                 raise _error(status, body)
             except (urllib.error.URLError, OSError) as e:
-                if attempt == self.retries:
+                if attempt >= self.retries:
                     raise LSEError(0, f"request failed before an HTTP response: {getattr(e, 'reason', None) or e}",
                                    "no-response")
                 time.sleep(min(0.25 * 2 ** attempt, 2))
+                attempt += 1
                 continue
             if status != 200:
                 raise _error(status, body)
@@ -406,7 +414,10 @@ class Data3Mixin:
                 raise
             state.pop("job_id", None)
             self._save_state(state_path, state)
-            if e.code == "export-failed" and "no stored data" in str(e.message):
+            # A job that failed for want of rows is the server's data-unavailable.
+            # Its sentence has read "... has no stored data ..." and, since
+            # November 2026, "No stored data for this selection ...".
+            if e.code == "export-failed" and "no stored data" in str(e.message).lower():
                 raise LSEError(404, e.message, "data-unavailable") from None
             raise
 
@@ -499,7 +510,10 @@ class Data3Mixin:
             if progress:
                 progress({"phase": "downloading", "bytes": count, "total_bytes": total})
 
-        for attempt in range(self.retries + 1):
+        # As in _json: a waited 429 is not a try, a retry uses one up, and a
+        # refusal that outlasts the tries is raised with the server's own code.
+        attempt, waited = 0, False
+        while True:
             if time.monotonic() >= deadline:
                 raise LSEError(0, "the download timed out; repeat the same call to resume", "timeout")
             if state.get("job_id"):
@@ -521,10 +535,11 @@ class Data3Mixin:
                 status, headers, body, written = self._fetch_export(
                     url, str(part), offset, etag, transferred, received, timeout=max(0.1, deadline - time.monotonic()))
             except (urllib.error.URLError, OSError) as e:
-                if attempt == self.retries:
+                if attempt >= self.retries:
                     raise LSEError(0, f"download interrupted ({getattr(e, 'reason', None) or e}); "
                                       "run the same call again to resume", "no-response")
                 time.sleep(min(0.25 * 2 ** attempt, 2))
+                attempt += 1
                 continue
             if status == 202:
                 try:
@@ -534,10 +549,12 @@ class Data3Mixin:
                 self._save_state(state_path, state)
                 return self._export(export_path, params, filename, target, progress, max(0.001, deadline - time.monotonic()))
             if status not in (200, 206):
-                if status == 429 and self._wait_out(headers.get("retry-after")):
+                if status == 429 and not waited and self._wait_out(headers.get("retry-after")):
+                    waited = True
                     continue
                 if status in _RETRY_STATUSES and attempt < self.retries:
                     time.sleep(min(0.25 * 2 ** attempt, 2))
+                    attempt += 1
                     continue
                 if not state.get("job_id") and not part.exists():
                     state_path.unlink()  # a refusal before any byte leaves nothing to resume
@@ -567,10 +584,13 @@ class Data3Mixin:
                dest=None, progress: Optional[Callable] = None, timeout: float = 1800) -> str:
         """Save a selection as CSV or Parquet and return the file's path.
 
-        A small export streams at once; a large one is prepared as a job and
-        polled. An interrupted call keeps ``.part`` and ``.part.json`` beside
-        the destination, and repeating the same call resumes it. The file is
-        placed only after its size and SHA-256 match what the server states.
+        The server sends an export whole, with its size and SHA-256; a
+        transfer that is cut is asked again, and the file is placed only
+        after its SHA-256 matches what the server states. One export reads at
+        most 2,500,000 rows (``413 export-too-wide`` past that): estimate()
+        says how many a selection holds. A server that prepares an export as
+        a job instead, as before November 2026, is polled and its file
+        resumed with ``Range`` from the ``.part`` beside the destination.
         """
         if not start or not end or timeout <= 0:
             raise ValueError("Export needs start, end, and a positive timeout")
@@ -586,21 +606,27 @@ class Data3Mixin:
         """A CSV export held in memory: streamed at once, or prepared and then fetched."""
         url = self._data_url(path, **params)
         deadline = time.monotonic() + timeout
-        for attempt in range(self.retries + 1):
+        # As in _json: a waited 429 is not a try, a retry uses one up, and a
+        # refusal that outlasts the tries is raised with the server's own code.
+        attempt, waited = 0, False
+        while True:
             try:
                 resp = self._open(url, timeout=max(1.0, min(timeout, 3600.0)))
             except urllib.error.HTTPError as e:
                 body = e.read(65536)
-                if e.code == 429 and self._wait_out(e.headers.get("Retry-After")):
+                if e.code == 429 and not waited and self._wait_out(e.headers.get("Retry-After")):
+                    waited = True
                     continue
                 if e.code in _RETRY_STATUSES and attempt < self.retries:
                     time.sleep(min(0.25 * 2 ** attempt, 2))
+                    attempt += 1
                     continue
                 raise _error(e.code, body)
             except (urllib.error.URLError, OSError) as e:
-                if attempt == self.retries:
+                if attempt >= self.retries:
                     raise LSEError(0, f"request failed before an HTTP response: {getattr(e, 'reason', None) or e}", "no-response")
                 time.sleep(min(0.25 * 2 ** attempt, 2))
+                attempt += 1
                 continue
             with resp:
                 if resp.status == 202:
@@ -608,8 +634,18 @@ class Data3Mixin:
                     info = self._wait_job(job["job_id"], deadline, None)
                     return self._fetch_file_bytes(self._data_url(info.get("download_url") or f"/v3/jobs/{job['job_id']}/file"),
                                                   int(info["bytes"]), info["checksum"].lower(), deadline)
-                return self._read_capped(resp)
-        raise LSEError(0, "the request could not be completed", "no-response")
+                data = self._read_capped(resp)
+                checksum = resp.headers.get("x-checksum-sha256")
+                if not checksum or not re.fullmatch(r"[0-9a-fA-F]{64}", checksum):
+                    raise LSEError(0, "the server did not supply a valid row-download checksum", "checksum-missing")
+                length = resp.headers.get("content-length")
+                try:
+                    size_matches = length is None or len(data) == int(length)
+                except ValueError:
+                    size_matches = False
+                if not size_matches or hashlib.sha256(data).hexdigest() != checksum.lower():
+                    raise LSEError(0, "the downloaded rows failed their size or SHA-256 check; call again", "checksum-mismatch")
+                return data
 
     def _read_capped(self, resp) -> bytes:
         buf = io.BytesIO()
@@ -776,7 +812,7 @@ class Data3Mixin:
 
     def macro_export(self, kind: str, code: str, start: str, end: str, *, format: str = "parquet", dest=None,
                      progress: Optional[Callable] = None, timeout: float = 1800) -> str:
-        """Save a macro series as CSV or Parquet, resumable and checked like export()."""
+        """Save a macro series as CSV or Parquet, checked like export()."""
         if not start or not end:
             raise ValueError("Export needs start and end")
         params = self._macro_params(kind, code, start, end, format)

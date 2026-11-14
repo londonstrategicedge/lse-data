@@ -1,9 +1,9 @@
-"""Pull history as a file: CSV or Parquet, resumable, checked by SHA-256.
+"""Pull history as a file: CSV or Parquet, checked by SHA-256.
 
-A small export streams at once; a large one is prepared on the server and
-polled. If the connection drops, run the same call again and it resumes from
-the bytes already received. The file is placed only after its size and
-checksum match what the server states.
+The server sends every export whole, with its size and SHA-256. If the
+connection drops the client asks for it again, and the file is placed only
+after its checksum matches what the server states. One export reads at most
+2,500,000 rows; estimate() says how many a selection holds.
 
 Usage:
     LSE_API_KEY=lse_live_... python history_file.py

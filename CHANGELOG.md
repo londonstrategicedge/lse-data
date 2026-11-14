@@ -1,5 +1,23 @@
 # Changelog
 
+## LSE Data 3.0.1
+
+Fixes to the 3.0 client; the calls and their names are the same. `pip install -U lse-data`.
+
+Fixed
+
+- Direct `rows()` downloads, including `candles()`, verify the response SHA-256 and declared size before parsing. A damaged or shortened CSV is refused instead of becoming partial history.
+- Long weekly and monthly `candles()` reads keep each candle whole. Internal date chunks previously split a week or month into two partial rows. Timestamp-bounded daily reads also stay whole across exchange session boundaries, and intraday chunks join a candle that crosses a session boundary. Requested start/end bounds and the row limit are preserved.
+- A `429` could come back as nothing. With `retries=0`, a call that waited out a `429` returned `None` (`usage()` and every JSON call), or raised `no-response` (`rows()`, `candles()`, the reference readers) or `download-missing` (`export()`), although the server would have answered the next ask; a client that had waited once could do the same on a later call with the default retries. Now every call waits a `Retry-After` of two minutes or less once, the wait does not use up a retry, nothing is carried from one call to the next, and a refusal that stands is raised as `LSEError` with the server's own code and sentence (`calls-exhausted`, `connections-exhausted`, `rows-exhausted`, `allowance-exhausted`).
+- Crypto streams again from the default client. Crypto moved to `wss://london-ws.londonstrategicedge.com` on 8 November 2026, and `stream(["BTC/USD", "AAPL"])` on the default address then gave one old price for BTC/USD and nothing after it. The client now opens the crypto socket beside the default one, with the same key, for the symbols the catalogue lists as crypto, and their ticks arrive in the same loop and callbacks; `subscribe()` and `unsubscribe()` while connected go to the right socket. A client made with `url=` uses that socket alone, as before. If the crypto socket refuses the key, the `error` event carries its sentence with that address and the other symbols keep streaming.
+- A missing-data answer is recognised by its code, whatever its sentence: the server's sentence now begins "No stored data for this selection" and says why.
+
+Changed
+
+- `stream(..., start=...)` and `stream_async(..., start=...)`: replay was removed from the sockets on 25 October 2026, and a `start` left the loop waiting for ticks that never came. The server's refusal is now raised as `LSEError` (410, `REPLAY_REMOVED`) with its sentence. For history use `candles()`, `rows()` or `export()`.
+- The README's examples run as written: the Level 2 and Level 3 examples ask for a minute by time, the years-of-candles example asks for five years (about half of the 2,500,000 rows one export may read), the options flow examples name their day.
+- The guide (`docs/api.md`) describes the server as it answers now: files are sent at once and not kept (the prepared-job routes answer `404 export-unknown`), paid plans download at 250 Mbit/s, one export reads at most 2,500,000 rows (`413 export-too-wide`), the free plan reads 12,500,000 rows a day (`429 rows-exhausted`), and `/v3/usage` reports both under `rows`.
+
 ## LSE Data 3.0
 
 Every read of history now comes from `https://download.londonstrategicedge.com/v3`: eleven markets, over 76,000 instruments and 67 million US options contracts, resumable CSV and Parquet exports checked by SHA-256, macro and reference data, options chains and flow. The websocket, the key and the package are the same. [docs/api.md](https://github.com/londonstrategicedge/lse-data/blob/main/docs/api.md) describes every call.
