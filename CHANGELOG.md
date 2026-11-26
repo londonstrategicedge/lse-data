@@ -1,5 +1,14 @@
 # Changelog
 
+## LSE Data 3.0.2
+
+Fixed
+
+- London (`HIK.L`, `VOD.L`) and European (`ASML.EU`) share subscriptions now use the London socket automatically with the default client. Previously they were sent to the default socket, where authentication and subscription succeeded but no share ticks followed. Crypto and other markets can still stream in the same loop or callbacks, including after a reconnect.
+- A bare share name such as `HIK` resolves to `HIK.L` when that is its only match in the authenticated catalogue and no exact bare symbol is listed. An exact symbol takes precedence. An ambiguous bare name raises `LSEError` with code `symbol-ambiguous` and lists the explicit spellings; it is never guessed. Use `.L` or `.EU` when the name is absent from the default catalogue. Subscribing and unsubscribing accept these same spellings.
+
+`pip install -U lse-data` installs the fix. A client given an explicit `url=` continues to use that socket alone and requires its symbol spellings. Historical downloads are unchanged.
+
 ## LSE Data 3.0.1
 
 Fixes to the 3.0 client; the calls and their names are the same. `pip install -U lse-data`.

@@ -752,6 +752,11 @@ its `timeout` raises it with code `timeout`. On a `429` that carries a `Retry-Af
 unless it was made with `wait_for_limit=False`; a refusal that stands is raised with the server's code and sentence.
 
 The same client streams live prices with the same key, `client.stream([...])`: the
-[WebSocket documentation](https://londonstrategicedge.com/websocket-documentation) describes the sockets. Crypto
-streams from `wss://london-ws.londonstrategicedge.com`, which a client on the default address opens beside the default
-socket for the crypto symbols it is asked for.
+[WebSocket documentation](https://londonstrategicedge.com/websocket-documentation) describes the sockets. London
+shares (`HIK.L`), European shares (`ASML.EU`) and crypto use `wss://london-ws.londonstrategicedge.com`, which the
+default client opens beside its main socket. Their ticks share the same iterator or callbacks with other markets.
+A bare share name resolves only when the authenticated catalogue has one matching `.L` or `.EU` name and no exact
+bare symbol. An exact bare symbol takes precedence; an ambiguous name raises `LSEError` with code
+`symbol-ambiguous` and lists the explicit spellings. Use the suffix when the default catalogue has no such name.
+These rules also apply to `subscribe()` and `unsubscribe()`. With an explicit `url=`, all subscriptions go to
+that one socket using its symbol spellings.

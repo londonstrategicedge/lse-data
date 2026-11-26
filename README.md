@@ -154,7 +154,9 @@ client.connect(["BTC/USD"])
 
 Events are `tick`, `connected`, `authenticated`, `disconnected` and `error`.
 
-Crypto streams from `wss://london-ws.londonstrategicedge.com`; the default socket carries the other symbols of these examples. The client opens the crypto socket beside the default one, with the same key, for the crypto symbols you ask for, so one loop or callback carries both; a plan's connections are counted on each socket. If the crypto socket refuses the key, the `error` event says so with that address and the other symbols keep streaming. `LSE(api_key, url=...)` uses the one socket you name and nothing else; the [WebSocket documentation](https://londonstrategicedge.com/websocket-documentation) lists the sockets and what each carries.
+London shares (`HIK.L`, `VOD.L`), European shares (`ASML.EU`) and crypto stream from `wss://london-ws.londonstrategicedge.com`. The default client opens that socket beside the default one, with the same key, when you ask for any of those symbols. For example, `client.stream(["HIK.L", "ASML.EU", "BTC/USD", "AAPL"])` delivers all four in one loop; a plan's connections are counted on each socket. If the London socket refuses the key, the `error` event says so with that address and the other symbols keep streaming.
+
+A bare share name such as `HIK` resolves to `HIK.L` only when the authenticated catalogue has that one match and no exact bare name. An exact bare symbol takes precedence; an ambiguous name raises `LSEError` with code `symbol-ambiguous` and lists the available spellings. Use `.L` or `.EU` when the name is absent from the default catalogue. `subscribe()` and `unsubscribe()` use the same rules. `LSE(api_key, url=...)` uses the one socket you name and requires its symbol spellings; the [WebSocket documentation](https://londonstrategicedge.com/websocket-documentation) lists the sockets and what each carries.
 
 Change subscriptions while connected:
 
@@ -213,7 +215,7 @@ Every setting of `LSE()` is optional:
 | `poll_seconds` | `0.5` | how often a prepared export is polled |
 | `wait_for_limit` | `True` | on a `429`, wait the server's `Retry-After` once in a call, when it is two minutes or less, and ask again without using up a retry; `False` never waits |
 | `data_url` | `https://download.londonstrategicedge.com` | the LSE Data 3.0 server |
-| `url` | `wss://data-ws.londonstrategicedge.com` | the live WebSocket; left at its default, crypto symbols are streamed from `wss://london-ws.londonstrategicedge.com` beside it |
+| `url` | `wss://data-ws.londonstrategicedge.com` | the live WebSocket; left at its default, `.L`/`.EU` shares and crypto stream from `wss://london-ws.londonstrategicedge.com` beside it |
 
 ```python
 client = LSE(api_key="your_key", timeout=120, wait_for_limit=False)

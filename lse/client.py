@@ -241,13 +241,14 @@ class LSE(Data3Mixin):
         self._api_key = api_key
         self._url = url
         self._ws: Optional[websockets.client.WebSocketClientProtocol] = None
-        # Crypto goes to its own socket only for a client on the default address.
+        # London/European shares and crypto use London beside the default socket.
         self._route_crypto = url.rstrip("/") == WS_URL
         self._crypto_url = CRYPTO_WS_URL
         self._crypto_ws = None                          # the crypto socket, once it has authenticated
         self._crypto_task: Optional[asyncio.Future] = None
         self._crypto_names: Set[str] = set()            # the catalogue's Crypto symbols, upper case
         self._crypto_plain: Set[str] = set()            # the same without their slashes (BTCUSD)
+        self._london_aliases: Dict[str, List[str]] = {}  # unique bare names, unless already listed
         self._tick_queue: Optional[asyncio.Queue] = None
         self._stream_start: Optional[str] = None
         self._callbacks: Dict[str, List[Callable]] = {}
@@ -355,9 +356,9 @@ class LSE(Data3Mixin):
     def stream(self, symbols: List[str], reconnect: bool = True, start: Optional[str] = None) -> Iterator[Tick]:
         """Stream live ticks. Blocks forever, yields Tick objects.
 
-        On the default address the crypto symbols of the list are served by
-        the crypto socket (CRYPTO_WS_URL) and everything else by the default
-        one; the ticks of both arrive in this one loop.
+        On the default address London shares (.L), European shares (.EU) and
+        crypto are served by the London socket (CRYPTO_WS_URL); other symbols
+        use the default socket. The ticks of both arrive in this one loop.
 
         Args:
             symbols: List of symbols to subscribe to (e.g. ["BTC/USD", "AAPL"]).
@@ -442,10 +443,10 @@ class LSE(Data3Mixin):
     def subscribe(self, symbols: List[str]):
         """Subscribe to more symbols. Works before connect() or stream() and
         while connected: the client sends them once it is authenticated, and
-        again after a reconnect. On the default address a crypto symbol is
-        subscribed on the crypto socket, which is opened if it is not yet.
+        again after a reconnect. On the default address London/European shares
+        and crypto use the London socket, which is opened when needed.
         """
-        for sym in symbols:
+        for sym in dict.fromkeys(self._stream_symbol(s) for s in symbols):
             self._subscriptions.add(sym)
             if self._ws and self._loop:
                 asyncio.run_coroutine_threadsafe(self._send_symbol("subscribe", sym), self._loop)
@@ -462,7 +463,7 @@ class LSE(Data3Mixin):
         Example:
             client.unsubscribe(["BTC/USD"])  # stop receiving BTC ticks
         """
-        for sym in symbols:
+        for sym in dict.fromkeys(self._stream_symbol(s) for s in symbols):
             self._subscriptions.discard(sym)
             if self._ws and self._loop:
                 asyncio.run_coroutine_threadsafe(self._send_symbol("unsubscribe", sym), self._loop)
@@ -1286,7 +1287,7 @@ class LSE(Data3Mixin):
 
         The socket is read by a task of its own that hands its ticks to this
         generator, so that on the default address a second task can read the
-        crypto socket beside it and both arrive in one loop. The session ends
+        London socket beside it and both arrive in one loop. The session ends
         when the main socket does."""
         # Store the event loop so sync methods (subscribe, disconnect) can
         # schedule coroutines from other threads via run_coroutine_threadsafe
@@ -1335,11 +1336,10 @@ class LSE(Data3Mixin):
     def _replay_refusal(msg: dict) -> LSEError:
         return LSEError(410, str(msg.get("message") or "Replay has been removed."), "REPLAY_REMOVED")
 
-    # ── crypto on the default address ──────────────────────────────────
+    # ── London shares and crypto on the default address ────────────────
 
     def _learn_crypto(self, catalogue) -> None:
-        """Which symbols are crypto, from the catalogue the socket sends when
-        it authenticates: the rows whose category is Crypto."""
+        """Learn crypto symbols and safe bare share aliases from authentication."""
         if not self._route_crypto:
             return
         listed, names = set(), set()
@@ -1353,6 +1353,30 @@ class LSE(Data3Mixin):
         self._crypto_names = names
         # The server reads BTCUSD as BTC/USD unless BTCUSD is itself listed.
         self._crypto_plain = {n.replace("/", "") for n in names if "/" in n} - listed
+        aliases: Dict[str, List[str]] = {}
+        for sym in sorted(listed):
+            if sym.endswith((".L", ".EU")):
+                bare = sym.rsplit(".", 1)[0]
+                if bare and bare not in listed:
+                    aliases.setdefault(bare, []).append(sym)
+        self._london_aliases = aliases
+
+    def _stream_symbol(self, symbol: str) -> str:
+        """Resolve a share alias only when the catalogue makes it unambiguous."""
+        if not self._route_crypto:
+            return symbol
+        upper = str(symbol).upper()
+        choices = self._london_aliases.get(upper, [])
+        if len(choices) > 1:
+            raise LSEError(400, "Ambiguous streaming symbol " + upper + "; use " +
+                           " or ".join(choices) + ".", "symbol-ambiguous")
+        if choices:
+            return choices[0]
+        return upper if upper.endswith((".L", ".EU")) else symbol
+
+    def _uses_london(self, symbol: str) -> bool:
+        # .EU names need not be present in the default socket's catalogue.
+        return self._route_crypto and (str(symbol).upper().endswith((".L", ".EU")) or self._is_crypto(symbol))
 
     def _is_crypto(self, symbol) -> bool:
         """Whether this client sends a symbol to the crypto socket: only on
@@ -1363,15 +1387,16 @@ class LSE(Data3Mixin):
         return sym in self._crypto_names or ("/" not in sym and len(sym) >= 5 and sym in self._crypto_plain)
 
     def _start_crypto(self) -> None:
-        """Open the crypto socket beside the default one, unless it is open."""
+        """Open the London socket beside the default one, unless it is open."""
         task = self._crypto_task
         if self._tick_queue is not None and (task is None or task.done()):
             self._crypto_task = asyncio.ensure_future(self._crypto_session(self._tick_queue, self._stream_start))
 
     async def _send_symbol(self, action: str, symbol: str) -> None:
         """One subscribe or unsubscribe, on the socket that serves the symbol."""
+        symbol = self._stream_symbol(symbol)
         ws = self._ws
-        if self._is_crypto(symbol):
+        if self._uses_london(symbol):
             if action == "subscribe":
                 self._start_crypto()
             # Until the crypto socket has authenticated there is nothing to
@@ -1424,13 +1449,13 @@ class LSE(Data3Mixin):
                             # passed to connect() or stream() and any added with
                             # subscribe(), so subscriptions made before connecting or
                             # before a reconnect take effect. Option underlyings follow.
-                            # On the default address the crypto symbols are left to
-                            # the crypto socket, opened here when there are any.
+                            # The London socket carries .L/.EU shares and crypto.
                             for sym in symbols:
                                 self._subscriptions.add(sym)
+                            self._subscriptions = {self._stream_symbol(s) for s in self._subscriptions}
                             crypto = False
                             for sym in list(self._subscriptions):
-                                if self._is_crypto(sym):
+                                if self._uses_london(sym):
                                     crypto = True
                                     continue
                                 sub_msg = {"action": "subscribe", "symbol": sym}
@@ -1491,11 +1516,14 @@ class LSE(Data3Mixin):
             raise
         except Exception as e:
             ended = e
+            if isinstance(e, LSEError) and e.code == "symbol-ambiguous":
+                self._disconnect_requested = True
+                self._emit("error", str(e))
         await queue.put(("end", ended))
 
     async def _crypto_session(self, queue: asyncio.Queue, start: Optional[str]) -> None:
-        """The crypto socket beside the default one: the same key, the crypto
-        symbols of this client's subscriptions, their ticks into the same
+        """The London socket beside the default one: the same key, the London
+        shares and crypto of this client's subscriptions, their ticks into the same
         queue. It reconnects by itself while the main session lives; what it
         is refused goes to the "error" callbacks with the socket's address,
         and the default socket carries on."""
@@ -1520,7 +1548,7 @@ class LSE(Data3Mixin):
                                 authenticated = True
                                 self._crypto_ws = ws
                                 for sym in list(self._subscriptions):
-                                    if self._is_crypto(sym):
+                                    if self._uses_london(sym):
                                         sub_msg = {"action": "subscribe", "symbol": sym}
                                         if start:
                                             sub_msg["start"] = start
